@@ -1,5 +1,6 @@
 //! CPU rasterisation for native operators: vector shapes through tiny-skia,
-//! glyphs through fontdue. Spike stand-ins for vello_cpu and parley/swash
+//! glyphs through swash. tiny-skia is a spike stand-in for vello_cpu, and the
+//! greedy line breaker stands in for parley
 //! (docs/ARCHITECTURE.md section 15), chosen for API stability.
 
 use std::collections::HashMap;
@@ -35,6 +36,9 @@ fn paint(c: Rgba) -> Paint<'static> {
 }
 
 pub fn round_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
+    if w <= 0.01 || h <= 0.01 {
+        return None; // e.g. a progress bar at 0%: nothing to fill
+    }
     let r = r.min(w * 0.5).min(h * 0.5).max(0.0);
     let mut pb = PathBuilder::new();
     pb.move_to(x + r, y);
@@ -134,11 +138,11 @@ impl Canvas {
         let mut pen = x * self.scale;
         for ch in s.chars() {
             let g = tr.glyph(ch, size);
-            let (m, cov) = (&g.0, &g.1);
-            let gx = (pen + m.xmin as f32).round() as i32;
-            let gy = (baseline - m.ymin as f32 - m.height as f32).round() as i32;
-            blit(&mut self.pm, gx, gy, m.width, m.height, cov, c);
-            pen += m.advance_width;
+            // placement: left from the pen, top above the baseline
+            let gx = (pen + g.left as f32).round() as i32;
+            let gy = (baseline - g.top as f32).round() as i32;
+            blit(&mut self.pm, gx, gy, g.w, g.h, &g.cov, c);
+            pen += g.advance;
         }
         pen / self.scale - x
     }
@@ -193,11 +197,24 @@ fn blit(pm: &mut Pixmap, gx: i32, gy: i32, gw: usize, gh: usize, cov: &[u8], c: 
     }
 }
 
-type Glyph = Arc<(fontdue::Metrics, Vec<u8>)>;
+struct GlyphBits {
+    left: i32,
+    top: i32,
+    w: usize,
+    h: usize,
+    advance: f32,
+    cov: Vec<u8>,
+}
 
+type Glyph = Arc<GlyphBits>;
+
+/// Glyph rasteriser on swash: TrueType, CFF and CFF2 outlines, variable fonts
+/// at their default instance (Android 15's Noto Sans CJK is a CFF2 variable font).
 pub struct TextRaster {
-    font: fontdue::Font,
-    cache: Mutex<HashMap<(char, u32), Glyph>>,
+    data: Vec<u8>,
+    offset: u32,
+    key: swash::CacheKey,
+    state: Mutex<(swash::scale::ScaleContext, HashMap<(char, u32), Glyph>)>,
     pub source: String,
 }
 
@@ -208,50 +225,87 @@ fn is_cjk(c: char) -> bool {
 
 impl TextRaster {
     pub fn load() -> Result<Self, String> {
+        // CJK-capable system fonts first, per platform; Latin-only last
         let candidates = [
             r"C:\Windows\Fonts\msjh.ttc",
             r"C:\Windows\Fonts\msyh.ttc",
             r"C:\Windows\Fonts\simsun.ttc",
-            r"C:\Windows\Fonts\segoeui.ttf",
-            r"C:\Windows\Fonts\arial.ttf",
+            "/system/fonts/NotoSansCJK-Regular.ttc",
+            "/system/fonts/NotoSansSC-Regular.otf",
+            "/system/fonts/DroidSansFallback.ttf",
             "/System/Library/Fonts/PingFang.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            r"C:\Windows\Fonts\segoeui.ttf",
+            r"C:\Windows\Fonts\arial.ttf",
+            "/system/fonts/Roboto-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ];
         for path in candidates {
             let Ok(bytes) = std::fs::read(path) else { continue };
-            let settings = fontdue::FontSettings { collection_index: 0, scale: 48.0, ..Default::default() };
-            if let Ok(font) = fontdue::Font::from_bytes(bytes, settings) {
-                return Ok(Self { font, cache: Mutex::new(HashMap::new()), source: path.to_string() });
+            let Some(font) = swash::FontRef::from_index(&bytes, 0) else { continue };
+            if font.charmap().map('A') == 0 {
+                continue;
             }
+            let (offset, key) = (font.offset, font.key);
+            return Ok(Self {
+                data: bytes,
+                offset,
+                key,
+                state: Mutex::new((swash::scale::ScaleContext::new(), HashMap::new())),
+                source: path.to_string(),
+            });
         }
         Err("no usable font found".into())
     }
 
+    fn font(&self) -> swash::FontRef<'_> {
+        swash::FontRef { data: &self.data, offset: self.offset, key: self.key }
+    }
+
     fn glyph(&self, ch: char, px: f32) -> Glyph {
         let key = (ch, (px * 4.0).round() as u32);
-        let mut cache = self.cache.lock().unwrap();
+        let mut guard = self.state.lock().unwrap();
+        let (ctx, cache) = &mut *guard;
         if let Some(g) = cache.get(&key) {
             return g.clone();
         }
         if cache.len() > 40_000 {
             cache.clear();
         }
-        let g: Glyph = Arc::new(self.font.rasterize(ch, px));
+        let font = self.font();
+        let id = font.charmap().map(ch);
+        let advance = font.glyph_metrics(&[]).scale(px).advance_width(id);
+        let mut scaler = ctx.builder(font).size(px).hint(false).build();
+        let image = swash::scale::Render::new(&[swash::scale::Source::Outline])
+            .format(swash::zeno::Format::Alpha)
+            .render(&mut scaler, id);
+        let g: Glyph = Arc::new(match image {
+            Some(img) => GlyphBits {
+                left: img.placement.left,
+                top: img.placement.top,
+                w: img.placement.width as usize,
+                h: img.placement.height as usize,
+                advance,
+                cov: img.data,
+            },
+            None => GlyphBits { left: 0, top: 0, w: 0, h: 0, advance, cov: Vec::new() },
+        });
         cache.insert(key, g.clone());
         g
     }
 
     fn advance(&self, ch: char, px: f32) -> f32 {
-        self.glyph(ch, px).0.advance_width
+        self.glyph(ch, px).advance
     }
 
     /// (ascent, line height) in pixels.
     pub fn line_metrics(&self, px: f32) -> (f32, f32) {
-        self.font
-            .horizontal_line_metrics(px)
-            .map(|m| (m.ascent, m.new_line_size))
-            .unwrap_or((px * 0.8, px * 1.25))
+        let m = self.font().metrics(&[]).scale(px);
+        let (ascent, descent) = (m.ascent, m.descent.abs());
+        if ascent <= 0.0 {
+            return (px * 0.8, px * 1.25);
+        }
+        (ascent, ascent + descent + m.leading.max(0.0))
     }
 
     /// Greedy line breaking. CJK characters break anywhere; other text breaks

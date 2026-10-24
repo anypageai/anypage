@@ -1,0 +1,17 @@
+[package]
+name = "anypage-desktop"
+description = "Desktop host (Windows, macOS, Linux): a thin winit shell around the AnyPage engine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "anypage"
+path = "src/main.rs"
+
+[dependencies]
+anypage-engine = { workspace = true }
+anypage-demo = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+log = { workspace = true }

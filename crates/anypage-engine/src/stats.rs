@@ -66,8 +66,19 @@ pub fn pct(v: &[f32], p: f32) -> f32 {
     s[(((p / 100.0) * (s.len() - 1) as f32).round() as usize).min(s.len() - 1)]
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn rss_mb() -> f64 {
     memory_stats::memory_stats().map(|m| m.physical_mem as f64 / (1024.0 * 1024.0)).unwrap_or(0.0)
+}
+
+/// Resident pages from /proc/self/statm (second field), 4 KiB pages.
+#[cfg(target_os = "android")]
+pub fn rss_mb() -> f64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|p| p.parse::<f64>().ok()))
+        .map(|pages| pages * 4096.0 / (1024.0 * 1024.0))
+        .unwrap_or(0.0)
 }
 
 pub struct Stats {
@@ -124,10 +135,12 @@ impl Stats {
         }
     }
 
-    pub fn on_present(&mut self, now: Instant, cpu_ms: f32) {
+    /// `paced`: the previous frame asked for this one immediately, so the gap
+    /// between them is a pacing measurement rather than intentional sleep.
+    pub fn on_present(&mut self, now: Instant, cpu_ms: f32, paced: bool) {
         self.frames += 1;
         self.frame_cpu.push(cpu_ms);
-        if let Some(last) = self.last_present {
+        if let (Some(last), true) = (self.last_present, paced) {
             self.interval.push((now - last).as_secs_f32() * 1000.0);
         }
         self.last_present = Some(now);

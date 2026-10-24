@@ -37,7 +37,12 @@ impl<K: Copy + Eq + Hash> RasterQueue<K> {
     /// are dropped here so the caller does not need to track them.
     pub fn publish(&self, wanted: impl IntoIterator<Item = K>) {
         let mut s = self.state.lock().unwrap();
-        let list: Vec<K> = wanted.into_iter().filter(|k| !s.inflight.contains(k)).collect();
+        // stored back to front so workers pop the head in O(1)
+        let mut list: Vec<K> = wanted.into_iter().filter(|k| !s.inflight.contains(k)).collect();
+        list.reverse();
+        if list == s.wanted {
+            return;
+        }
         s.wanted = list;
         if !s.wanted.is_empty() {
             self.cv.notify_all();
@@ -52,8 +57,7 @@ impl<K: Copy + Eq + Hash> RasterQueue<K> {
             if s.shutdown {
                 return None;
             }
-            if !s.wanted.is_empty() {
-                let key = s.wanted.remove(0);
+            if let Some(key) = s.wanted.pop() {
                 s.inflight.insert(key);
                 return Some(key);
             }

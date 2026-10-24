@@ -1,0 +1,18 @@
+[package]
+name = "anypage-engine"
+description = "The engine: one scheduler, one clock, one compositor for every page; hosted by thin platform shells"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anypage-core = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+bytemuck = { workspace = true }
+tiny-skia = { workspace = true }
+swash = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+memory-stats = { workspace = true }

@@ -1,5 +1,6 @@
-// A GPU operator (docs/ARCHITECTURE.md section 4.2): a pull stream that is a
-// pure function of time `t` and the page's `hue` input, evaluated per pixel.
+// A page-supplied GPU operator (docs/ARCHITECTURE.md section 4.2). The engine
+// compiles it at load time and binds the camera and this page's parameters:
+// p0.x = t (seconds), p0.y = hue (degrees).
 
 struct Camera {
     scale: f32,
@@ -12,9 +13,8 @@ struct Camera {
 
 struct Effect {
     rect: vec4<f32>,
-    t: f32,
-    hue: f32,
-    _pad: vec2<f32>,
+    p0: vec4<f32>,
+    p1: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> cam: Camera;
@@ -51,13 +51,13 @@ fn hsv2rgb(c: vec3<f32>) -> vec3<f32> {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let aspect = fx.rect.z / max(fx.rect.w, 1.0);
     let p = vec2<f32>(in.uv.x * aspect, in.uv.y) * 6.0;
-    let t = fx.t;
+    let t = fx.p0.x;
     let centre = vec2<f32>(3.0 * aspect * 0.5 + sin(t * 0.5) * 2.0, 3.0 + cos(t * 0.37) * 1.5);
     let v = sin(p.x + t)
           + sin(p.y * 1.3 + t * 1.7)
           + sin((p.x + p.y) * 0.7 + t * 0.9)
           + sin(length(p - centre) * 1.5 - t * 2.0);
-    let h = fract(fx.hue / 360.0 + v * 0.08);
+    let h = fract(fx.p0.y / 360.0 + v * 0.08);
     let rgb = hsv2rgb(vec3<f32>(h, 0.7, 0.35 + 0.25 * sin(v * 1.5)));
     return vec4<f32>(rgb, 1.0);
 }

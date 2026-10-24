@@ -1,0 +1,7 @@
+.gradle/
+build/
+app/build/
+local.properties
+# built by cargo-ndk from the Rust crate in this folder
+app/src/main/jniLibs/
+*.apk

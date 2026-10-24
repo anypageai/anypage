@@ -1,23 +1,38 @@
 //! The computation graph (docs/ARCHITECTURE.md section 4).
 //!
-//! A page is a graph of cells:
+//! There is no split between "static" and "dynamic" content. Everything on a
+//! page is a function of cells:
 //!
-//! * **input** cells are set by commands (user, script, agent, clock, camera);
-//! * **stream** cells are input cells fed by producers on other threads, with a
-//!   bounded buffer (backpressure) and an append or latest-wins policy;
-//! * **derived** cells are an operator applied to other cells. Inline operators
-//!   run on the evaluating thread; async operators run on the worker pool and
-//!   the cell is *pending* until the result is committed.
+//! * **input** cells are set by commands (user, script, agent, camera);
+//! * **stream** cells are input cells fed from other threads, with a bounded
+//!   buffer (backpressure) and an append or latest-wins policy;
+//! * the **clock** is an input cell holding seconds (`f64`);
+//! * **derived** cells apply an operator to other cells, inline or async.
 //!
-//! Evaluation is demand-driven: nothing is computed until a sink asks for it
-//! with [`Graph::demand`]. Changing a cell marks its dependents dirty, and
-//! cancels any async job that was computing from the old inputs. Results and
-//! stream items produced on other threads enter the graph only at
-//! [`Graph::commit`], so the graph itself is single-threaded and every frame
-//! sees a consistent version of everything.
+//! Static content is just a function whose inputs never change: computed once,
+//! then served from cache. Dynamic content is a function of inputs that change.
+//! Efficiency comes from three mechanisms:
+//!
+//! 1. **Demand.** Nothing is computed until a sink asks; invisible sinks cost nothing.
+//! 2. **Early cutoff.** A cell is recomputed only if an input's version changed,
+//!    and an operator may declare value equality, so a recomputation that
+//!    yields the same value stops propagation there.
+//! 3. **Predictable time.** An operator that reads the clock can declare how
+//!    long its value stays valid ([`EvalCtx::valid_until`]). Advancing the
+//!    clock before that moment does not re-run it, and
+//!    [`Graph::next_expiry`] tells the scheduler exactly when to wake: every
+//!    frame for an animation, once a second for a clock, never for a stopped
+//!    animation.
+//!
+//! Results and stream items produced on other threads enter the graph only at
+//! [`Graph::commit`], so the graph is single-threaded and every frame sees one
+//! consistent version.
 
 use std::any::Any;
-use std::collections::VecDeque;
+use std::cell::Cell as StdCell;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -86,17 +101,31 @@ impl Input {
 pub struct EvalCtx {
     cancel: Arc<AtomicBool>,
     progress: Arc<AtomicU32>,
+    expires: StdCell<f64>,
+    declared: StdCell<bool>,
 }
 
 impl EvalCtx {
     fn new() -> Self {
-        Self { cancel: Arc::new(AtomicBool::new(false)), progress: Arc::new(AtomicU32::new(0)) }
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(AtomicU32::new(0)),
+            expires: StdCell::new(f64::INFINITY),
+            declared: StdCell::new(false),
+        }
     }
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
     pub fn set_progress(&self, p: f32) {
         self.progress.store((p.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
+    }
+    /// The value just computed stays correct while the clock is below `t`.
+    /// `f64::INFINITY` means "constant from now on". An operator that reads the
+    /// clock without calling this is assumed to change on every tick.
+    pub fn valid_until(&self, t: f64) {
+        self.declared.set(true);
+        self.expires.set(self.expires.get().min(t));
     }
 }
 
@@ -109,6 +138,10 @@ pub trait Op: Send + Sync + 'static {
         Exec::Inline
     }
     fn eval(&self, inputs: &[Input], ctx: &EvalCtx) -> Result<Value, String>;
+    /// Value equality for early cutoff. Default: never equal.
+    fn same(&self, _a: &Value, _b: &Value) -> bool {
+        false
+    }
 }
 
 struct FnOp<F> {
@@ -136,12 +169,51 @@ where
     }
 }
 
+struct MemoOp<T, F> {
+    name: String,
+    class: OpClass,
+    f: F,
+    _t: PhantomData<fn() -> T>,
+}
+
+impl<T, F> Op for MemoOp<T, F>
+where
+    T: PartialEq + Any + Send + Sync,
+    F: Fn(&[Input], &EvalCtx) -> Result<T, String> + Send + Sync + 'static,
+{
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn class(&self) -> OpClass {
+        self.class
+    }
+    fn eval(&self, inputs: &[Input], ctx: &EvalCtx) -> Result<Value, String> {
+        (self.f)(inputs, ctx).map(|v| Arc::new(v) as Value)
+    }
+    fn same(&self, a: &Value, b: &Value) -> bool {
+        match (a.downcast_ref::<T>(), b.downcast_ref::<T>()) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
+    }
+}
+
 /// Operator that runs on the evaluating thread.
 pub fn op_inline<F>(name: &str, class: OpClass, f: F) -> Arc<dyn Op>
 where
     F: Fn(&[Input], &EvalCtx) -> Result<Value, String> + Send + Sync + 'static,
 {
     Arc::new(FnOp { name: name.to_string(), class, exec: Exec::Inline, f })
+}
+
+/// Inline operator with a typed, comparable result: an unchanged result stops
+/// propagation (early cutoff).
+pub fn op_memo<T, F>(name: &str, class: OpClass, f: F) -> Arc<dyn Op>
+where
+    T: PartialEq + Any + Send + Sync,
+    F: Fn(&[Input], &EvalCtx) -> Result<T, String> + Send + Sync + 'static,
+{
+    Arc::new(MemoOp { name: name.to_string(), class, f, _t: PhantomData })
 }
 
 /// Operator that runs on the worker pool; its cell is pending until commit.
@@ -256,7 +328,29 @@ impl<T> StreamProducer<T> {
 enum Kind {
     Input,
     Stream(Box<dyn StreamBuf>),
-    Derived { op: Arc<dyn Op>, inputs: Vec<CellId> },
+    /// `inputs` is shared so recomputation can hold it without copying.
+    Derived { op: Arc<dyn Op>, inputs: Arc<[CellId]> },
+}
+
+/// Min-heap entry: a clock reader whose value expires at `.0`.
+struct Timer(f64, CellId);
+
+impl PartialEq for Timer {
+    fn eq(&self, o: &Self) -> bool {
+        self.cmp(o) == CmpOrdering::Equal
+    }
+}
+impl Eq for Timer {}
+impl PartialOrd for Timer {
+    fn partial_cmp(&self, o: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Timer {
+    fn cmp(&self, o: &Self) -> CmpOrdering {
+        // reversed: BinaryHeap is a max-heap, we want the earliest expiry on top
+        o.0.total_cmp(&self.0).then_with(|| o.1.cmp(&self.1))
+    }
 }
 
 struct Job {
@@ -270,12 +364,18 @@ struct Cell {
     label: String,
     kind: Kind,
     value: Option<Value>,
+    /// Bumps whenever the value or the status observably changes.
     version: u64,
     status: Status,
+    /// "Maybe stale": an input's version may have changed. Verified on demand.
     dirty: bool,
     dependents: Vec<CellId>,
+    /// Input versions the current value (or running job) was computed from.
+    deps_seen: Vec<u64>,
     job: Option<Job>,
     eval_us: f32,
+    /// For cells reading the clock: the value holds while clock < expires.
+    expires: f64,
 }
 
 struct Completion {
@@ -288,7 +388,14 @@ struct Completion {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GraphStats {
+    /// Operator runs on the evaluating thread.
     pub inline_evals: u64,
+    /// Dirty cells found unchanged without running their operator.
+    pub verified: u64,
+    /// Operator ran but produced an equal value; propagation stopped.
+    pub cutoffs: u64,
+    /// Clock advanced but the cell's declared validity had not expired.
+    pub clock_skips: u64,
     pub async_started: u64,
     pub async_completed: u64,
     pub async_cancelled: u64,
@@ -317,6 +424,17 @@ pub struct Graph {
     pool: Arc<ThreadPool>,
     wake: Option<Wake>,
     next_gen: u64,
+    clock: Option<CellId>,
+    /// Clock readers ordered by expiry; `tick` only touches the ones due.
+    timers: BinaryHeap<Timer>,
+    /// Bumps when cells are added; invalidates structural caches.
+    structure: u64,
+    /// Bumps whenever dirtiness changes from outside evaluation; a saved
+    /// traversal is only resumed if nothing was marked since it was saved.
+    mutations: u64,
+    resume: Option<(CellId, u64, Vec<(CellId, bool)>)>,
+    readers_cache: HashMap<CellId, Vec<CellId>>,
+    readers_structure: u64,
     pub stats: GraphStats,
 }
 
@@ -332,6 +450,13 @@ impl Graph {
             pool,
             wake: None,
             next_gen: 1,
+            clock: None,
+            timers: BinaryHeap::new(),
+            structure: 0,
+            mutations: 0,
+            resume: None,
+            readers_cache: HashMap::new(),
+            readers_structure: u64::MAX,
             stats: GraphStats::default(),
         }
     }
@@ -352,14 +477,32 @@ impl Graph {
             status,
             dirty,
             dependents: Vec::new(),
+            deps_seen: Vec::new(),
             job: None,
             eval_us: 0.0,
+            expires: f64::NEG_INFINITY,
         });
+        self.structure += 1;
         id
     }
 
     pub fn input(&mut self, label: &str, v: Value) -> CellId {
         self.push(label, Kind::Input, Some(v), Status::Ready, false)
+    }
+
+    /// The page clock: an input cell holding seconds as `f64`.
+    pub fn clock(&mut self, label: &str) -> CellId {
+        let id = self.input(label, val(0.0f64));
+        self.clock = Some(id);
+        id
+    }
+
+    pub fn clock_id(&self) -> Option<CellId> {
+        self.clock
+    }
+
+    pub fn clock_now(&self) -> f64 {
+        self.clock.and_then(|c| self.get::<f64>(c).copied()).unwrap_or(0.0)
     }
 
     /// `cap`: items kept in the snapshot. `bound`: items buffered between
@@ -388,7 +531,7 @@ impl Graph {
     }
 
     pub fn derive(&mut self, label: &str, op: Arc<dyn Op>, inputs: &[CellId]) -> CellId {
-        let id = self.push(label, Kind::Derived { op, inputs: inputs.to_vec() }, None, Status::Empty, true);
+        let id = self.push(label, Kind::Derived { op, inputs: Arc::from(inputs) }, None, Status::Empty, true);
         for &i in inputs {
             self.cells[i.index()].dependents.push(id);
         }
@@ -405,10 +548,47 @@ impl Graph {
         self.invalidate_dependents(id)
     }
 
-    /// Mark everything downstream of `id` dirty and cancel jobs computing from
-    /// stale inputs. Stops at cells that are already dirty: their dependents
-    /// are dirty by construction.
+    /// Command: replace an input's value only if it differs. Returns whether it did.
+    pub fn set_if_changed<T: PartialEq + Any + Send + Sync>(&mut self, id: CellId, v: T) -> bool {
+        if self.get::<T>(id) == Some(&v) {
+            return false;
+        }
+        self.set(id, val(v));
+        true
+    }
+
+    /// Advance the clock. Only clock readers whose declared validity has
+    /// expired are invalidated (with their dependents); the rest are not even
+    /// visited, so a tick costs O(cells due), not O(cells reading time).
+    pub fn tick(&mut self, now: f64) -> usize {
+        let Some(clock) = self.clock else { return 0 };
+        {
+            let c = &mut self.cells[clock.index()];
+            c.value = Some(val(now));
+            c.version += 1;
+        }
+        let mut marked = 0;
+        while let Some(top) = self.timers.peek() {
+            if top.0 > now {
+                break;
+            }
+            let Timer(at, id) = self.timers.pop().expect("peeked");
+            let c = &mut self.cells[id.index()];
+            if c.expires != at || c.dirty {
+                continue; // stale entry, or already scheduled for verification
+            }
+            c.dirty = true;
+            self.stats.dirty_marks += 1;
+            marked += 1 + self.invalidate_dependents(id);
+        }
+        marked
+    }
+
+    /// Mark everything downstream of `id` as maybe-stale. Stops at cells that
+    /// are already dirty: their dependents are dirty by construction. Jobs are
+    /// not cancelled here, because a dirty cell may still verify unchanged.
     fn invalidate_dependents(&mut self, id: CellId) -> usize {
+        self.mutations += 1;
         let mut marked = 0;
         let mut stack: Vec<CellId> = self.cells[id.index()].dependents.clone();
         while let Some(d) = stack.pop() {
@@ -418,10 +598,6 @@ impl Graph {
             }
             c.dirty = true;
             marked += 1;
-            if let Some(job) = c.job.take() {
-                job.cancel.store(true, Ordering::Relaxed);
-                self.stats.async_cancelled += 1;
-            }
             stack.extend_from_slice(&c.dependents);
         }
         self.stats.dirty_marks += marked as u64;
@@ -442,6 +618,17 @@ impl Graph {
     pub fn cancel_all(&mut self) {
         for id in self.pending.clone() {
             self.cancel(id);
+        }
+    }
+
+    fn set_status(&mut self, id: CellId, s: Status) -> bool {
+        let c = &mut self.cells[id.index()];
+        if c.status != s {
+            c.status = s;
+            c.version += 1;
+            true
+        } else {
+            false
         }
     }
 
@@ -478,6 +665,7 @@ impl Graph {
             }
             c.job = None;
             c.eval_us = done.eval_us;
+            c.expires = f64::INFINITY;
             match done.result {
                 Ok(v) => {
                     c.value = Some(v);
@@ -495,23 +683,23 @@ impl Graph {
         self.pending.retain(|id| cells[id.index()].job.is_some());
         for k in 0..self.pending.len() {
             let id = self.pending[k];
-            let changed = {
+            let progressed = {
                 let c = &mut self.cells[id.index()];
                 match &mut c.job {
                     Some(job) => {
                         let p = job.progress.load(Ordering::Relaxed);
                         if p != job.seen_progress {
                             job.seen_progress = p;
-                            c.status = Status::Pending { progress: p as f32 / 1000.0 };
-                            true
+                            Some(p)
                         } else {
-                            false
+                            None
                         }
                     }
-                    None => false,
+                    None => None,
                 }
             };
-            if changed {
+            if let Some(p) = progressed {
+                self.set_status(id, Status::Pending { progress: p as f32 / 1000.0 });
                 rep.progressed += 1;
                 rep.dirty_marked += self.invalidate_dependents(id);
             }
@@ -523,8 +711,18 @@ impl Graph {
 
     /// Sink side: bring `id` up to date (or start its async job) and return it.
     pub fn demand(&mut self, id: CellId) -> Input {
-        self.ensure(id);
+        self.ensure(id, None);
         self.view(id)
+    }
+
+    /// Like [`Graph::demand`], but stops at `deadline`. Work done so far is
+    /// kept; the next call continues from there. Returns `None` if unfinished.
+    pub fn demand_until(&mut self, id: CellId, deadline: Instant) -> Option<Input> {
+        if self.ensure(id, Some(deadline)) {
+            Some(self.view(id))
+        } else {
+            None
+        }
     }
 
     pub fn view(&self, id: CellId) -> Input {
@@ -533,30 +731,48 @@ impl Graph {
     }
 
     /// Iterative post-order walk so deep graphs cannot overflow the stack.
-    fn ensure(&mut self, root: CellId) {
+    /// Returns false if the deadline stopped it before `root` was settled.
+    fn ensure(&mut self, root: CellId, deadline: Option<Instant>) -> bool {
         if !self.cells[root.index()].dirty {
-            return;
+            return true;
         }
-        let mut stack = vec![(root, false)];
+        let mut stack = match self.resume.take() {
+            Some((r, m, s)) if r == root && m == self.mutations => s,
+            _ => vec![(root, false)],
+        };
+        let mut steps = 0u32;
         while let Some((id, expanded)) = stack.pop() {
             if !self.cells[id.index()].dirty {
                 continue;
             }
             if expanded {
                 self.recompute(id);
+                steps += 1;
+                if let Some(d) = deadline {
+                    if steps % 32 == 0 && Instant::now() >= d {
+                        if self.cells[root.index()].dirty {
+                            self.resume = Some((root, self.mutations, stack));
+                            return false;
+                        }
+                        return true;
+                    }
+                }
                 continue;
             }
             stack.push((id, true));
             if let Kind::Derived { inputs, .. } = &self.cells[id.index()].kind {
-                for &i in inputs {
+                for &i in inputs.iter() {
                     if self.cells[i.index()].dirty {
                         stack.push((i, false));
                     }
                 }
             }
         }
+        true
     }
 
+    /// Verify a dirty derived cell whose inputs are settled, and recompute it
+    /// only when something it actually depends on has changed.
     fn recompute(&mut self, id: CellId) {
         let (op, input_ids) = match &self.cells[id.index()].kind {
             Kind::Derived { op, inputs } => (op.clone(), inputs.clone()),
@@ -565,7 +781,45 @@ impl Graph {
                 return;
             }
         };
+        let clock_now = self.clock_now();
+
+        // 1) verification, allocation-free: did anything this cell read change?
+        let (computed, other_changed, clock_changed) = {
+            let c = &self.cells[id.index()];
+            let computed = c.deps_seen.len() == input_ids.len() && !matches!(c.status, Status::Empty);
+            let mut other = false;
+            let mut clock = false;
+            if computed {
+                for (k, &i) in input_ids.iter().enumerate() {
+                    if c.deps_seen[k] != self.cells[i.index()].version {
+                        if Some(i) == self.clock {
+                            clock = true;
+                        } else {
+                            other = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            (computed, other, clock)
+        };
+        if computed && !other_changed && (!clock_changed || clock_now < self.cells[id.index()].expires) {
+            for (k, &i) in input_ids.iter().enumerate() {
+                let v = self.cells[i.index()].version;
+                self.cells[id.index()].deps_seen[k] = v;
+            }
+            self.cells[id.index()].dirty = false;
+            if clock_changed {
+                self.stats.clock_skips += 1;
+            } else {
+                self.stats.verified += 1;
+            }
+            return;
+        }
+        let versions: Vec<u64> = input_ids.iter().map(|i| self.cells[i.index()].version).collect();
+
         let inputs: Vec<Input> = input_ids.iter().map(|&i| self.view(i)).collect();
+        let reads_clock = self.clock.map_or(false, |c| input_ids.contains(&c));
 
         match op.exec() {
             Exec::Inline => {
@@ -573,26 +827,52 @@ impl Graph {
                 let t = Instant::now();
                 let r = op.eval(&inputs, &ctx);
                 let us = t.elapsed().as_secs_f32() * 1e6;
+                let expires = if ctx.declared.get() {
+                    ctx.expires.get()
+                } else if reads_clock {
+                    clock_now // stale at the next tick
+                } else {
+                    f64::INFINITY
+                };
+                self.stats.inline_evals += 1;
+                if reads_clock && expires.is_finite() {
+                    self.timers.push(Timer(expires, id));
+                }
                 let c = &mut self.cells[id.index()];
                 c.dirty = false;
                 c.eval_us = us;
-                c.version += 1;
+                c.deps_seen = versions;
+                c.expires = expires;
                 match r {
                     Ok(v) => {
-                        c.value = Some(v);
-                        c.status = Status::Ready;
+                        let same = matches!(c.status, Status::Ready) && c.value.as_ref().map_or(false, |old| op.same(old, &v));
+                        if same {
+                            self.stats.cutoffs += 1;
+                        } else {
+                            c.value = Some(v);
+                            c.status = Status::Ready;
+                            c.version += 1;
+                        }
                     }
-                    Err(e) => c.status = Status::Error(e),
+                    Err(e) => {
+                        let e = Status::Error(e);
+                        if c.status != e {
+                            c.status = e;
+                            c.version += 1;
+                        }
+                    }
                 }
-                self.stats.inline_evals += 1;
             }
             Exec::Async => {
-                // An async operator waits until its inputs are settled; the
-                // input's commit will mark this cell dirty again.
+                // inputs changed: the running job (if any) computes from stale data
+                if let Some(job) = self.cells[id.index()].job.take() {
+                    job.cancel.store(true, Ordering::Relaxed);
+                    self.stats.async_cancelled += 1;
+                }
+                // wait until inputs settle; their commit marks this cell dirty again
                 if inputs.iter().any(|i| matches!(i.status, Status::Pending { .. } | Status::Empty)) {
-                    let c = &mut self.cells[id.index()];
-                    c.dirty = false;
-                    c.status = Status::Pending { progress: 0.0 };
+                    self.cells[id.index()].dirty = false;
+                    self.set_status(id, Status::Pending { progress: 0.0 });
                     return;
                 }
                 let gen = self.next_gen;
@@ -616,14 +896,64 @@ impl Graph {
                         w();
                     }
                 });
-                let c = &mut self.cells[id.index()];
-                c.dirty = false;
-                c.status = Status::Pending { progress: 0.0 };
-                c.job = Some(Job { gen, cancel, progress, seen_progress: 0 });
+                {
+                    let c = &mut self.cells[id.index()];
+                    c.dirty = false;
+                    c.deps_seen = versions;
+                    c.job = Some(Job { gen, cancel, progress, seen_progress: 0 });
+                }
+                self.set_status(id, Status::Pending { progress: 0.0 });
                 self.pending.push(id);
                 self.stats.async_started += 1;
             }
         }
+    }
+
+    // --- predictable time -----------------------------------------------------
+
+    /// Cells upstream of `sink` (inclusive) that read the clock directly.
+    /// Cached until the graph's structure changes.
+    pub fn clock_readers(&mut self, sink: CellId) -> &[CellId] {
+        if self.readers_structure != self.structure {
+            self.readers_cache.clear();
+            self.readers_structure = self.structure;
+        }
+        if !self.readers_cache.contains_key(&sink) {
+            let mut found = Vec::new();
+            if let Some(clock) = self.clock {
+                let mut seen = HashSet::new();
+                let mut stack = vec![sink];
+                while let Some(id) = stack.pop() {
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    if let Kind::Derived { inputs, .. } = &self.cells[id.index()].kind {
+                        if inputs.contains(&clock) {
+                            found.push(id);
+                        }
+                        stack.extend_from_slice(inputs);
+                    }
+                }
+            }
+            self.readers_cache.insert(sink, found);
+        }
+        &self.readers_cache[&sink]
+    }
+
+    /// The clock time at which any of these sinks may next change because of
+    /// time alone. `f64::INFINITY`: nothing they show depends on time any more.
+    /// A value at or before the current clock means "every frame".
+    pub fn next_expiry(&mut self, sinks: &[CellId]) -> f64 {
+        let mut next = f64::INFINITY;
+        for &s in sinks {
+            let readers: Vec<CellId> = self.clock_readers(s).to_vec();
+            for r in readers {
+                let c = &self.cells[r.index()];
+                let e = if c.deps_seen.is_empty() { f64::NEG_INFINITY } else { c.expires };
+                next = next.min(e);
+            }
+        }
+        next
     }
 
     // --- inspection (the graph view of the semantic port starts here) ---
@@ -649,6 +979,9 @@ impl Graph {
     pub fn eval_us(&self, id: CellId) -> f32 {
         self.cells[id.index()].eval_us
     }
+    pub fn expires(&self, id: CellId) -> f64 {
+        self.cells[id.index()].expires
+    }
     pub fn get<T: Any>(&self, id: CellId) -> Option<&T> {
         self.cells[id.index()].value.as_deref().and_then(|v| v.downcast_ref::<T>())
     }
@@ -670,7 +1003,7 @@ impl Graph {
     /// Inputs of a derived cell (empty for input and stream cells).
     pub fn inputs_of(&self, id: CellId) -> &[CellId] {
         match &self.cells[id.index()].kind {
-            Kind::Derived { inputs, .. } => inputs,
+            Kind::Derived { inputs, .. } => &inputs[..],
             _ => &[],
         }
     }
@@ -726,6 +1059,95 @@ mod tests {
     }
 
     #[test]
+    fn early_cutoff_stops_propagation() {
+        let mut g = graph();
+        let x = g.input("x", val(200i64));
+        let clamp = g.derive("clamp", op_memo("clamp", OpClass::Native, |i, _| Ok((*i[0].get::<i64>().unwrap()).min(100))), &[x]);
+        let heavy = g.derive("heavy", sum_op(), &[clamp]);
+        assert_eq!(*g.demand(heavy).get::<i64>().unwrap(), 100);
+        let evals = g.stats.inline_evals;
+        g.set(x, val(300i64)); // clamp still yields 100
+        assert_eq!(*g.demand(heavy).get::<i64>().unwrap(), 100);
+        assert_eq!(g.stats.inline_evals - evals, 1, "only clamp re-ran");
+        assert_eq!(g.stats.cutoffs, 1);
+        assert_eq!(g.stats.verified, 1, "heavy verified without running");
+    }
+
+    #[test]
+    fn declared_validity_skips_clock_ticks_and_predicts_next_wake() {
+        let mut g = graph();
+        let clock = g.clock("t");
+        // a 1 Hz clock display: value changes only at whole seconds
+        let secs = g.derive(
+            "secs",
+            op_memo("secs", OpClass::Native, |i, ctx| {
+                let t = *i[0].get::<f64>().unwrap();
+                ctx.valid_until(t.floor() + 1.0);
+                Ok(t.floor() as i64)
+            }),
+            &[clock],
+        );
+        let view = g.derive("view", sum_op(), &[secs]);
+        g.tick(0.10);
+        assert_eq!(*g.demand(view).get::<i64>().unwrap(), 0);
+        assert_eq!(g.next_expiry(&[view]), 1.0);
+        let evals = g.stats.inline_evals;
+        for k in 1..=9 {
+            assert_eq!(g.tick(0.10 + k as f64 * 0.09), 0, "sub-second ticks touch nothing");
+            g.demand(view);
+        }
+        assert_eq!(g.stats.inline_evals, evals, "no re-evaluation before the second turns");
+        assert!(g.tick(1.02) >= 1);
+        assert_eq!(*g.demand(view).get::<i64>().unwrap(), 1);
+        assert_eq!(g.next_expiry(&[view]), 2.0);
+    }
+
+    #[test]
+    fn undeclared_clock_reader_is_every_frame_and_constant_is_never() {
+        let mut g = graph();
+        let clock = g.clock("t");
+        let anim = g.derive("anim", op_inline("anim", OpClass::Native, |i, _| Ok(val(*i[0].get::<f64>().unwrap()))), &[clock]);
+        let still = g.derive(
+            "still",
+            op_inline("still", OpClass::Native, |_, ctx| {
+                ctx.valid_until(f64::INFINITY);
+                Ok(val(0.0f64))
+            }),
+            &[clock],
+        );
+        g.tick(5.0);
+        g.demand(anim);
+        g.demand(still);
+        assert!(g.next_expiry(&[anim]) <= 5.0, "animation wants every frame");
+        assert_eq!(g.next_expiry(&[still]), f64::INFINITY, "constant never wakes");
+    }
+
+    #[test]
+    fn budgeted_demand_resumes_across_calls() {
+        let mut g = graph();
+        let root = g.input("root", val(0i64));
+        let slow = op_inline("slow", OpClass::Native, |inp, _| {
+            std::thread::sleep(Duration::from_micros(200));
+            Ok(val(inp[0].get::<i64>().unwrap() + 1))
+        });
+        let mut prev = root;
+        for _ in 0..200 {
+            prev = g.derive("n", slow.clone(), &[prev]);
+        }
+        let mut calls = 0;
+        let v = loop {
+            calls += 1;
+            if let Some(v) = g.demand_until(prev, Instant::now() + Duration::from_millis(5)) {
+                break v;
+            }
+            assert!(calls < 1000);
+        };
+        assert_eq!(*v.get::<i64>().unwrap(), 200);
+        assert!(calls > 1, "40 ms of work in 5 ms slices needs several calls");
+        assert_eq!(g.stats.inline_evals, 200, "no work repeated across slices");
+    }
+
+    #[test]
     fn async_completes_at_commit() {
         let mut g = graph();
         let x = g.input("x", val(21i64));
@@ -755,8 +1177,21 @@ mod tests {
         let y = g.derive("y", op, &[x]);
         g.demand(y);
         g.set(x, val(7i64));
+        g.demand(y);
         assert_eq!(g.stats.async_cancelled, 1);
         assert_eq!(*settle(&mut g, y).get::<i64>().unwrap(), 7);
+    }
+
+    #[test]
+    fn unchanged_inputs_do_not_restart_async_job() {
+        let mut g = graph();
+        let x = g.input("x", val(5i64));
+        let y = g.derive("y", op_async("id", |inp, _| Ok(val(*inp[0].get::<i64>().unwrap()))), &[x]);
+        assert_eq!(*settle(&mut g, y).get::<i64>().unwrap(), 5);
+        let started = g.stats.async_started;
+        assert!(!g.set_if_changed(x, 5i64));
+        g.demand(y);
+        assert_eq!(g.stats.async_started, started);
     }
 
     #[test]

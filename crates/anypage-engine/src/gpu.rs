@@ -1,13 +1,14 @@
 //! The compositor: one wgpu device, a textured-quad pipeline for tiles, panels
-//! and the HUD, a GPU-operator pipeline for the effect, and a texture store
-//! with an LRU byte budget for tiles.
+//! and the HUD, one pipeline per page-supplied GPU operator, and a texture
+//! store with an LRU byte budget for tiles. The surface can be detached and
+//! re-attached (Android destroys it whenever the app goes to the background).
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
 use anypage_core::TileKey;
-use winit::window::Window;
+use wgpu::rwh::{RawDisplayHandle, RawWindowHandle};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -37,14 +38,12 @@ impl CameraUniform {
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct EffectUniform {
     pub rect: [f32; 4],
-    pub t: f32,
-    pub hue: f32,
-    pub _pad: [f32; 2],
+    pub p: [f32; 8],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TexKey {
-    Tile(TileKey),
+    Tile(u16, TileKey),
     Panel(u32),
     Hud,
 }
@@ -61,25 +60,61 @@ pub struct GpuTex {
 
 pub enum Draw {
     Quads { key: TexKey, range: Range<u32>, screen: bool },
-    Effect,
+    Effect(usize),
+}
+
+/// What the host gives the engine to draw into.
+pub enum Target {
+    /// A window object (winit and friends).
+    Handle(Arc<dyn wgpu::WindowHandle>),
+    /// Raw platform handles; the host keeps them valid until `detach_surface`.
+    Raw { display: RawDisplayHandle, window: RawWindowHandle },
+}
+
+impl Target {
+    fn surface(&self, instance: &wgpu::Instance) -> Result<wgpu::Surface<'static>, String> {
+        match self {
+            Target::Handle(h) => instance.create_surface(h.clone()).map_err(|e| e.to_string()),
+            // SAFETY: the host guarantees the handles outlive the surface (it
+            // calls `detach_surface` before invalidating them).
+            Target::Raw { display, window } => unsafe {
+                instance
+                    .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                        raw_display_handle: *display,
+                        raw_window_handle: *window,
+                    })
+                    .map_err(|e| e.to_string())
+            },
+        }
+    }
+}
+
+struct EffectGpu {
+    pipeline: wgpu::RenderPipeline,
+    buf: wgpu::Buffer,
+    bg: wgpu::BindGroup,
 }
 
 pub const MAX_QUADS: usize = 16384;
 const TEX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 pub struct Gpu {
-    surface: wgpu::Surface<'static>,
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    vsync: bool,
     pub adapter_info: wgpu::AdapterInfo,
     quad_pipeline: wgpu::RenderPipeline,
-    effect_pipeline: wgpu::RenderPipeline,
     tex_layout: wgpu::BindGroupLayout,
+    cam_layout: wgpu::BindGroupLayout,
+    fx_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     world_cam: (wgpu::Buffer, wgpu::BindGroup),
     screen_cam: (wgpu::Buffer, wgpu::BindGroup),
-    effect: (wgpu::Buffer, wgpu::BindGroup),
+    effects: Vec<EffectGpu>,
     vertex_buf: wgpu::Buffer,
     textures: HashMap<TexKey, GpuTex>,
     pub tile_budget_bytes: usize,
@@ -92,11 +127,7 @@ fn uniform_layout(device: &wgpu::Device, label: &str, vis: wgpu::ShaderStages) -
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: vis,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         }],
     })
@@ -145,34 +176,41 @@ fn backend_order() -> Vec<wgpu::Backends> {
 }
 
 impl Gpu {
-    pub fn new(window: Arc<Window>, vsync: bool, tile_budget_bytes: usize) -> Self {
+    pub fn new(target: &Target, w: u32, h: u32, vsync: bool, tile_budget_bytes: usize) -> Result<Self, String> {
         let mut chosen = None;
+        let mut errors = Vec::new();
         for backends in backend_order() {
             let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor { backends, ..Default::default() });
-            let Ok(surface) = instance.create_surface(window.clone()) else { continue };
+            let surface = match target.surface(&instance) {
+                Ok(s) => s,
+                Err(e) => {
+                    errors.push(format!("{backends:?}: surface: {e}"));
+                    continue;
+                }
+            };
             let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             }));
-            if let Ok(adapter) = adapter {
-                chosen = Some((surface, adapter));
-                break;
+            match adapter {
+                Ok(a) => {
+                    chosen = Some((instance, surface, a));
+                    break;
+                }
+                Err(e) => errors.push(format!("{backends:?}: adapter: {e}")),
             }
-            eprintln!("backend {backends:?} unavailable, trying the next one");
         }
-        let (surface, adapter) = chosen.expect("no usable GPU backend");
+        let (instance, surface, adapter) = chosen.ok_or_else(|| format!("no usable GPU backend: {}", errors.join("; ")))?;
         let adapter_info = adapter.get_info();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("anypage"),
+            required_limits: wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
             ..Default::default()
         }))
-        .expect("request device");
+        .map_err(|e| format!("request device: {e}"))?;
 
-        let size = window.inner_size();
-        let mut config = surface
-            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
-            .expect("surface config");
+        let mut config = surface.get_default_config(&adapter, w.max(1), h.max(1)).ok_or("surface not supported by adapter")?;
         config.present_mode = if vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
         surface.configure(&device, &config);
 
@@ -204,21 +242,12 @@ impl Gpu {
             label: Some("quads"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
-        let fx_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("effect"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("effect.wgsl").into()),
-        });
-
         let quad_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("quads"),
             bind_group_layouts: &[&tex_layout, &cam_layout],
             push_constant_ranges: &[],
         });
-        let target = [Some(wgpu::ColorTargetState {
-            format: config.format,
-            blend: Some(PREMULTIPLIED),
-            write_mask: wgpu::ColorWrites::ALL,
-        })];
+        let target_state = [Some(wgpu::ColorTargetState { format: config.format, blend: Some(PREMULTIPLIED), write_mask: wgpu::ColorWrites::ALL })];
         let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("quads"),
             layout: Some(&quad_layout),
@@ -235,34 +264,7 @@ impl Gpu {
             fragment: Some(wgpu::FragmentState {
                 module: &quad_shader,
                 entry_point: Some("fs_main"),
-                targets: &target,
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        let fx_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("effect"),
-            bind_group_layouts: &[&cam_layout, &fx_layout],
-            push_constant_ranges: &[],
-        });
-        let effect_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("effect"),
-            layout: Some(&fx_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &fx_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &fx_shader,
-                entry_point: Some("fs_main"),
-                targets: &target,
+                targets: &target_state,
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
@@ -282,11 +284,9 @@ impl Gpu {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-
         let cam_size = std::mem::size_of::<CameraUniform>() as u64;
         let world_cam = uniform_buffer(&device, &cam_layout, cam_size, "world camera");
         let screen_cam = uniform_buffer(&device, &cam_layout, cam_size, "screen camera");
-        let effect = uniform_buffer(&device, &fx_layout, std::mem::size_of::<EffectUniform>() as u64, "effect");
         let vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("quads"),
             size: (MAX_QUADS * 6 * std::mem::size_of::<Vertex>()) as u64,
@@ -294,24 +294,76 @@ impl Gpu {
             mapped_at_creation: false,
         });
 
-        Self {
-            surface,
+        Ok(Self {
+            instance,
+            adapter,
+            surface: Some(surface),
             device,
             queue,
             config,
+            vsync,
             adapter_info,
             quad_pipeline,
-            effect_pipeline,
             tex_layout,
+            cam_layout,
+            fx_layout,
             sampler,
             world_cam,
             screen_cam,
-            effect,
+            effects: Vec::new(),
             vertex_buf,
             textures: HashMap::new(),
             tile_budget_bytes,
             frame: 0,
-        }
+        })
+    }
+
+    /// Compile a page-supplied GPU operator. Returns its index for `Draw::Effect`.
+    pub fn add_effect(&mut self, wgsl: &str) -> usize {
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("page effect"),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("page effect"),
+            bind_group_layouts: &[&self.cam_layout, &self.fx_layout],
+            push_constant_ranges: &[],
+        });
+        let target_state = [Some(wgpu::ColorTargetState { format: self.config.format, blend: Some(PREMULTIPLIED), write_mask: wgpu::ColorWrites::ALL })];
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("page effect"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_main"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs_main"), targets: &target_state, compilation_options: Default::default() }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+        let (buf, bg) = uniform_buffer(&self.device, &self.fx_layout, std::mem::size_of::<EffectUniform>() as u64, "effect params");
+        self.effects.push(EffectGpu { pipeline, buf, bg });
+        self.effects.len() - 1
+    }
+
+    pub fn has_surface(&self) -> bool {
+        self.surface.is_some()
+    }
+
+    /// Drop the surface but keep the device and every texture.
+    pub fn detach_surface(&mut self) {
+        self.surface = None;
+    }
+
+    pub fn attach_surface(&mut self, target: &Target, w: u32, h: u32) -> Result<(), String> {
+        let surface = target.surface(&self.instance)?;
+        let mut config = surface.get_default_config(&self.adapter, w.max(1), h.max(1)).ok_or("surface not supported by adapter")?;
+        config.format = self.config.format; // pipelines are built for this format
+        config.present_mode = if self.vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
+        surface.configure(&self.device, &config);
+        self.config = config;
+        self.surface = Some(surface);
+        Ok(())
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
@@ -320,7 +372,9 @@ impl Gpu {
         }
         self.config.width = w;
         self.config.height = h;
-        self.surface.configure(&self.device, &self.config);
+        if let Some(s) = &self.surface {
+            s.configure(&self.device, &self.config);
+        }
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -373,12 +427,7 @@ impl Gpu {
         t.pinned = pinned;
         t.last_used = self.frame;
         self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &t.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+            wgpu::TexelCopyTextureInfo { texture: &t.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             rgba,
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -389,7 +438,7 @@ impl Gpu {
         let mut n = 0;
         let mut b = 0;
         for (k, t) in &self.textures {
-            if matches!(k, TexKey::Tile(_)) {
+            if matches!(k, TexKey::Tile(..)) {
                 n += 1;
                 b += (t.w * t.h * 4) as usize;
             }
@@ -407,7 +456,7 @@ impl Gpu {
         let mut victims: Vec<(u64, TexKey, usize)> = self
             .textures
             .iter()
-            .filter(|(k, t)| matches!(k, TexKey::Tile(_)) && !t.pinned && t.last_used != current)
+            .filter(|(k, t)| matches!(k, TexKey::Tile(..)) && !t.pinned && t.last_used != current)
             .map(|(k, t)| (t.last_used, *k, (t.w * t.h * 4) as usize))
             .collect();
         victims.sort_unstable_by_key(|v| v.0);
@@ -424,22 +473,26 @@ impl Gpu {
         evicted
     }
 
+    /// Returns Ok(false) when there is no surface to draw into.
     pub fn render(
         &mut self,
         world: CameraUniform,
         screen: CameraUniform,
-        effect: Option<EffectUniform>,
+        effects: &[(usize, EffectUniform)],
         verts: &[Vertex],
         draws: &[Draw],
         clear: wgpu::Color,
-    ) -> Result<(), wgpu::SurfaceError> {
-        let frame = self.surface.get_current_texture()?;
+    ) -> Result<bool, wgpu::SurfaceError> {
+        let Some(surface) = &self.surface else { return Ok(false) };
+        let frame = surface.get_current_texture()?;
         let view = frame.texture.create_view(&Default::default());
 
         self.queue.write_buffer(&self.world_cam.0, 0, bytemuck::bytes_of(&world));
         self.queue.write_buffer(&self.screen_cam.0, 0, bytemuck::bytes_of(&screen));
-        if let Some(fx) = effect {
-            self.queue.write_buffer(&self.effect.0, 0, bytemuck::bytes_of(&fx));
+        for (i, u) in effects {
+            if let Some(fx) = self.effects.get(*i) {
+                self.queue.write_buffer(&fx.buf, 0, bytemuck::bytes_of(u));
+            }
         }
         let n = verts.len().min(MAX_QUADS * 6);
         if n > 0 {
@@ -473,13 +526,11 @@ impl Gpu {
                         rp.set_bind_group(1, if *screen { &self.screen_cam.1 } else { &self.world_cam.1 }, &[]);
                         rp.draw(range.clone(), 0..1);
                     }
-                    Draw::Effect => {
-                        if effect.is_none() {
-                            continue;
-                        }
-                        rp.set_pipeline(&self.effect_pipeline);
+                    Draw::Effect(i) => {
+                        let Some(fx) = self.effects.get(*i) else { continue };
+                        rp.set_pipeline(&fx.pipeline);
                         rp.set_bind_group(0, &self.world_cam.1, &[]);
-                        rp.set_bind_group(1, &self.effect.1, &[]);
+                        rp.set_bind_group(1, &fx.bg, &[]);
                         rp.draw(0..6, 0..1);
                     }
                 }
@@ -488,6 +539,6 @@ impl Gpu {
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         self.frame += 1;
-        Ok(())
+        Ok(true)
     }
 }

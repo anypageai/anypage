@@ -1,13 +1,10 @@
 //! Static content the engine computes itself: a Tiled source whose pixels are a
-//! pure function of (tile key, parameters). Parameters come from the graph;
-//! their version is part of every tile request, so a parameter change makes old
-//! tiles stale (still drawn as fallback) and queued old requests cancelled.
+//! pure function of (tile key, parameters). The engine keys tiles by the
+//! parameter cell's version, so a parameter change makes old tiles stale (still
+//! drawn as fallback) and cancels queued requests for the old version.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
-
-use anypage_core::{level_scale, Rect, TileKey, TILE_SIZE};
+use anypage_core::{level_scale, Rect, TileKey, Value, TILE_SIZE};
+use anypage_engine::TileSource;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MandelParams {
@@ -15,39 +12,13 @@ pub struct MandelParams {
     pub hue: f32,
 }
 
-pub struct MandelSource {
+pub struct Mandel {
     pub rect: Rect,
-    versions: Mutex<VecDeque<(u32, MandelParams)>>,
-    latest: AtomicU32,
 }
 
-impl MandelSource {
-    pub fn new(rect: Rect) -> Self {
-        Self { rect, versions: Mutex::new(VecDeque::new()), latest: AtomicU32::new(0) }
-    }
-
-    pub fn latest(&self) -> u32 {
-        self.latest.load(Ordering::Relaxed)
-    }
-
-    pub fn publish(&self, ver: u32, p: MandelParams) {
-        let mut v = self.versions.lock().unwrap();
-        if v.back().map(|b| b.0) == Some(ver) {
-            return;
-        }
-        v.push_back((ver, p));
-        while v.len() > 32 {
-            v.pop_front();
-        }
-        self.latest.store(ver, Ordering::Relaxed);
-    }
-
-    pub fn params(&self, ver: u32) -> Option<MandelParams> {
-        self.versions.lock().unwrap().iter().rev().find(|e| e.0 == ver).map(|e| e.1)
-    }
-
-    /// RGBA8 (opaque) for one tile, or None if `cancelled` says stop.
-    pub fn render(&self, key: TileKey, p: MandelParams, cancelled: &dyn Fn() -> bool) -> Option<Vec<u8>> {
+impl TileSource for Mandel {
+    fn render(&self, key: TileKey, params: &Value, cancelled: &dyn Fn() -> bool) -> Option<Vec<u8>> {
+        let p = *params.downcast_ref::<MandelParams>()?;
         let n = TILE_SIZE as usize;
         let s = level_scale(key.level) as f64;
         let r = self.rect;
@@ -76,6 +47,14 @@ impl MandelSource {
         }
         Some(out)
     }
+}
+
+/// World point for a complex coordinate, for scripted camera moves.
+pub fn world_of(rect: Rect, re: f64, im: f64) -> (f32, f32) {
+    let span = 3.2 / rect.w as f64;
+    let re0 = -0.6 - 1.6;
+    let im0 = -(rect.h as f64 / rect.w as f64) * 1.6;
+    (rect.x + ((re - re0) / span) as f32, rect.y + ((im - im0) / span) as f32)
 }
 
 fn shade(cr: f64, ci: f64, max_it: u32, hue: f32) -> [u8; 3] {

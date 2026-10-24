@@ -2,9 +2,12 @@
 resolver = "2"
 members = [
     "crates/anypage-core",
-    "apps/spike1",
+    "crates/anypage-engine",
+    "crates/anypage-demo",
+    "apps/desktop",
+    "apps/android",
 ]
-# PDF importer is parked until the runtime spike works; it is not PDF-first.
+# PDF importer is parked; the engine is not PDF-first.
 exclude = ["crates/anypage-pdf"]
 
 [workspace.package]
@@ -14,8 +17,10 @@ publish = false
 
 [workspace.dependencies]
 anypage-core = { path = "crates/anypage-core" }
+anypage-engine = { path = "crates/anypage-engine" }
+anypage-demo = { path = "crates/anypage-demo" }
 
-# Pinned to API generations known to work together on Windows/DX12.
+# Pinned to API generations known to work together.
 # wgpu 30 is current upstream; upgrading is a deliberate, separate step.
 wgpu = "26"
 winit = "0.30"
@@ -23,7 +28,8 @@ pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 memory-stats = "1"
 tiny-skia = "0.11"
-fontdue = "0.9"
+swash = "0.2"
+log = "0.4"
 
 # Keep `target/` small (docs/ARCHITECTURE.md section 16) and dependencies fast even in dev.
 [profile.dev]

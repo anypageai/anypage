@@ -14,8 +14,8 @@ pub mod tiles;
 
 pub use camera::Camera;
 pub use graph::{
-    op_async, op_inline, val, CellId, CommitReport, EvalCtx, Exec, Graph, GraphStats, Input, Op, OpClass, Status,
-    StreamPolicy, StreamProducer, StreamSnapshot, Value, Wake,
+    op_async, op_inline, op_memo, val, CellId, CommitReport, EvalCtx, Exec, Graph, GraphStats, Input, Op, OpClass,
+    Status, StreamPolicy, StreamProducer, StreamSnapshot, Value, Wake,
 };
 pub use pool::ThreadPool;
 pub use sched::{QueueSnapshot, RasterQueue};

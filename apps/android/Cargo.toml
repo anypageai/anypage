@@ -1,0 +1,19 @@
+[package]
+name = "anypage-android"
+description = "Android host glue: the engine as a JNI library inside a native Kotlin app (docs/ARCHITECTURE.md section 14.4)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "anypage_android"
+crate-type = ["cdylib"]
+
+# On every other target this crate compiles to an empty library.
+[target.'cfg(target_os = "android")'.dependencies]
+anypage-engine = { workspace = true }
+anypage-demo = { workspace = true }
+log = { workspace = true }
+jni = "0.21"
+ndk = "0.9"
+android_logger = "0.14"
