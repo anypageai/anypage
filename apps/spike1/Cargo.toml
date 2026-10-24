@@ -1,0 +1,16 @@
+[package]
+name = "spike1"
+description = "Phase-0 spike 1: one page, every kind of timing (static, pull stream, push stream, async, operations) on one graph, one scheduler, one compositor"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anypage-core = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+pollster = { workspace = true }
+bytemuck = { workspace = true }
+memory-stats = { workspace = true }
+tiny-skia = { workspace = true }
+fontdue = { workspace = true }

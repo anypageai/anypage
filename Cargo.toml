@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/anypage-core",
+    "apps/spike1",
+]
+# PDF importer is parked until the runtime spike works; it is not PDF-first.
+exclude = ["crates/anypage-pdf"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+anypage-core = { path = "crates/anypage-core" }
+
+# Pinned to API generations known to work together on Windows/DX12.
+# wgpu 30 is current upstream; upgrading is a deliberate, separate step.
+wgpu = "26"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+memory-stats = "1"
+tiny-skia = "0.11"
+fontdue = "0.9"
+
+# Keep `target/` small (docs/ARCHITECTURE.md section 16) and dependencies fast even in dev.
+[profile.dev]
+debug = "line-tables-only"
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+debug = "line-tables-only"

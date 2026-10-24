@@ -1,0 +1,10 @@
+[package]
+name = "anypage-pdf"
+description = "L2 adapter: PDFium behind one dedicated thread, rasterising tiles for the core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anypage-core = { workspace = true }
+pdfium-render = { workspace = true }

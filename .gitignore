@@ -1,0 +1,28 @@
+# build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# signing material and secrets never enter this repo (docs/ARCHITECTURE.md, docs/legacy-play-signing.md)
+*.jks
+*.keystore
+*.p12
+*.p8
+*.pem
+*.key
+.env
+.env.*
+
+# prebuilt third-party binaries are fetched by scripts/fetch-pdfium.*
+/third_party/pdfium/*/
+!/third_party/pdfium/README.md
+
+# generated samples and bench output
+/samples/*.pdf
+/bench-results/
+
+# editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
