@@ -60,3 +60,16 @@ adb install -r app\build\outputs\apk\debug\app-debug.apk
 ```
 
 操作：拖曳平移，滾輪或雙指縮放，空白鍵 串流，A 連續動畫，T 定時內容，J 任務，C 取消，1 / 2 迭代，R 貼合，H 隱藏量測面板。`ANYPAGE_BACKEND=vulkan|dx12|gl` 可強制 GPU 後端。
+
+## 授權 License
+
+本機程式碼以 MIT 或 Apache-2.0 雙授權釋出，任選其一：[LICENSE-MIT](LICENSE-MIT)、[LICENSE-APACHE](LICENSE-APACHE)。
+
+Licensed under either of MIT or Apache-2.0, at your option. Unless you state otherwise, any contribution you submit for inclusion is dual licensed the same way, without additional terms.
+
+第三方元件 Third-party notes:
+
+- 依賴的 crate 各自保有授權（MIT、Apache-2.0、BSD、ISC、Zlib、MPL-2.0；`cargo tree` 可列出）。
+- `anypage-media` 從原始碼編譯 Cisco OpenH264（BSD-2-Clause）。H.264 有專利；自行編譯的 OpenH264 不在 Cisco 代付專利授權的範圍內，散布編譯好的 App 前請自行確認。
+- TLS 根憑證清單來自 `webpki-roots`（CDLA-Permissive-2.0）。
+- 字型取自作業系統，倉庫不附任何字型檔。

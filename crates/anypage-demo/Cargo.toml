@@ -4,6 +4,7 @@ description = "Demo page (in Rust and as a Luau package), the native operators i
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 anypage-core = { workspace = true }

@@ -4,6 +4,7 @@ description = "Android host glue: the engine as a JNI library inside a native Ko
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [lib]
 name = "anypage_android"

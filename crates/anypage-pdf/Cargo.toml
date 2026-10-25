@@ -4,6 +4,7 @@ description = "PDF module: open, render tiles, extract text and structure, searc
 version = "0.0.1"
 edition = "2021"
 publish = false
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 anypage-core = { path = "../anypage-core" }

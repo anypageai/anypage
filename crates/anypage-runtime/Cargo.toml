@@ -4,6 +4,7 @@ description = "Page runtime: page packages (JSON manifest + Luau scripts + WGSL 
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 anypage-core = { workspace = true }

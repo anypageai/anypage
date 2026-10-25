@@ -4,6 +4,7 @@ description = "Text system: shaping, bidi, font fallback and line breaking for e
 version = "0.0.1"
 edition = "2021"
 publish = false
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # Shaping (harfrust), bidi, UAX #14 line breaking, font database and

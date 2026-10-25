@@ -27,3 +27,6 @@
 .idea/
 Thumbs.db
 .DS_Store
+
+# private notes that never go public (personal identifiers)
+docs/legacy-play-signing.md

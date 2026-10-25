@@ -23,6 +23,7 @@ members = [
 version = "0.0.1"
 edition = "2021"
 publish = false
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 anypage-core = { path = "crates/anypage-core" }

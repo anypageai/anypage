@@ -4,6 +4,7 @@ description = "UI component library for page scripts: layout, buttons, lists, te
 version = "0.0.1"
 edition = "2021"
 publish = false
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 anypage-runtime = { path = "../anypage-runtime" }

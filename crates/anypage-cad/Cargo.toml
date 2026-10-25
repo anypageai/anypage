@@ -4,6 +4,7 @@ description = "CAD module: DXF read, render, measure, edit, write; STEP import t
 version = "0.0.1"
 edition = "2021"
 publish = false
+license = "MIT OR Apache-2.0"
 
 [features]
 # STEP import is on: it is part of the module spec (cad.step_to_mesh, job

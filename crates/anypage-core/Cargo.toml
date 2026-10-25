@@ -4,5 +4,6 @@ description = "L1 core pieces independent of any GPU API or domain engine: camer
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]

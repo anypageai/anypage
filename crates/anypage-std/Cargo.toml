@@ -4,6 +4,7 @@ description = "The app's standard native library: every capability module a page
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 anypage-runtime = { workspace = true }
