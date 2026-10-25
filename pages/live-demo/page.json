@@ -1,0 +1,13 @@
+{
+  "format": 1,
+  "id": "live-demo",
+  "name": "Live: broadcast and play HLS",
+  "version": "1",
+  "entry": "main.luau",
+  "bounds": [0, 0, 1300, 760],
+  "capabilities": {
+    "modules": ["media"],
+    "net": ["127.0.0.1", "0.0.0.0:18090"]
+  },
+  "limits": { "memory_mb": 64, "handler_ms": 100 }
+}

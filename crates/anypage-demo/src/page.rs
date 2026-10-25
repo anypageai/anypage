@@ -12,8 +12,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anypage_core::{
-    level_scale, op_async, op_inline, op_memo, val, CellId, Graph, Input, Op, OpClass, Rect, Status, StreamPolicy,
-    StreamSnapshot, ThreadPool, Wake,
+    level_scale, op_async, op_inline, op_memo, val, CellId, EvalCtx, Graph, Input, Op, OpClass, Rect, Status,
+    StreamPolicy, StreamSnapshot, ThreadPool, Wake,
 };
 use anypage_engine::{
     Canvas, Class, EffectLayer, EffectParams, Page, PageRequest, PageSpec, Panel, PointerResponse, Rgba, TextRaster,
@@ -459,7 +459,8 @@ impl DemoPage {
             bounds: BOUNDS,
             panels,
             tiled: vec![TiledLayer { rect: MANDEL, params: mandel_params, source: Arc::new(Mandel { rect: MANDEL }) }],
-            effects: vec![EffectLayer { rect: EFFECT, wgsl: include_str!("plasma.wgsl").to_string(), params: effect_params }],
+            effects: vec![EffectLayer { rect: EFFECT, wgsl: include_str!("../../../pages/demo/plasma.wgsl").to_string(), params: effect_params }],
+            layers: Vec::new(),
             camera_level: Some(cam_level),
         };
 
@@ -654,34 +655,54 @@ impl Page for DemoPage {
         self.request.take()
     }
 
+    fn control(&mut self, name: &str, value: f64) -> bool {
+        match name {
+            "iterations" => self.set_iterations(value as u32),
+            "hue" => self.set_hue(value as f32),
+            "jobs" => self.run_jobs(),
+            "cancel" => self.cancel_jobs(),
+            "streams" => self.set_streams(value != 0.0),
+            "anim" => self.set_anim(value != 0.0),
+            "timers" => self.set_timers(value != 0.0),
+            _ => return false,
+        }
+        true
+    }
+
     fn shutdown(&mut self) {
         self.quit.store(true, Ordering::Relaxed);
         self.graph.cancel_all();
     }
 }
 
-/// Synthetic CPU work that reports progress and honours cancellation.
+/// Synthetic CPU work that reports progress and honours cancellation:
+/// returns (a checksum, elapsed ms). Shared with the script page's `demo.compute`.
+pub fn compute_job(seed: u64, ctx: &EvalCtx) -> Result<(f64, f32), String> {
+    let t0 = Instant::now();
+    let dur_ms = 900 + seed % 2600;
+    let mut acc = 0.0f64;
+    for step in 0..100u64 {
+        if ctx.cancelled() {
+            return Err("已取消".into());
+        }
+        let deadline = t0 + Duration::from_millis(dur_ms * (step + 1) / 100);
+        while Instant::now() < deadline {
+            for k in 0..2000u64 {
+                acc += ((k ^ seed) as f64 * 1e-3).sin();
+            }
+        }
+        ctx.set_progress((step + 1) as f32 / 100.0);
+    }
+    Ok((std::hint::black_box(acc), t0.elapsed().as_secs_f32() * 1000.0))
+}
+
 fn job_op() -> Arc<dyn Op> {
     op_async("job.compute", |i, ctx| {
         let seed = *i[0].get::<u64>().unwrap_or(&0);
         if seed == 0 {
             return Ok(val(JobResult::Idle));
         }
-        let t0 = Instant::now();
-        let dur_ms = 900 + seed % 2600;
-        let mut acc = 0.0f64;
-        for step in 0..100u64 {
-            if ctx.cancelled() {
-                return Err("已取消".into());
-            }
-            let deadline = t0 + Duration::from_millis(dur_ms * (step + 1) / 100);
-            while Instant::now() < deadline {
-                for k in 0..2000u64 {
-                    acc += ((k ^ seed) as f64 * 1e-3).sin();
-                }
-            }
-            ctx.set_progress((step + 1) as f32 / 100.0);
-        }
-        Ok(val(JobResult::Done { value: std::hint::black_box(acc), ms: t0.elapsed().as_secs_f32() * 1000.0 }))
+        let (value, ms) = compute_job(seed, ctx)?;
+        Ok(val(JobResult::Done { value, ms }))
     })
 }

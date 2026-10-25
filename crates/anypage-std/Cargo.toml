@@ -1,0 +1,29 @@
+[package]
+name = "anypage-std"
+description = "The app's standard native library: every capability module a page can declare"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anypage-runtime = { workspace = true }
+anypage-demo = { workspace = true }
+anypage-ui = { workspace = true }
+anypage-pdf = { workspace = true }
+anypage-sheet = { workspace = true }
+anypage-cad = { workspace = true }
+anypage-cloud = { workspace = true }
+anypage-media = { workspace = true, features = ["audio"] }
+anypage-devices = { workspace = true }
+anypage-scene = { workspace = true }
+
+# Windows cameras through Media Foundation; Android cameras come from the host.
+[target.'cfg(windows)'.dependencies]
+anypage-media = { workspace = true, features = ["audio", "camera"] }
+
+# The page tests in tests/ load real packages and drive them through the Page trait.
+[dev-dependencies]
+anypage-core = { workspace = true }
+anypage-engine = { workspace = true }
+serde_json = { workspace = true }
+png = "0.17"

@@ -1,0 +1,16 @@
+[package]
+name = "anypage-ui"
+description = "UI component library for page scripts: layout, buttons, lists, text fields (Luau)"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+anypage-runtime = { path = "../anypage-runtime" }
+
+# the headless page tests drive the graph and the engine's Page trait directly
+[dev-dependencies]
+anypage-core = { path = "../anypage-core" }
+anypage-engine = { path = "../anypage-engine" }
+png = "0.17"
+serde_json = "1"

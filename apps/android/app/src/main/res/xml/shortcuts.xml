@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Long-press the launcher icon: the secrets screen (API keys pages declare). -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="secrets"
+        android:enabled="true"
+        android:shortcutShortLabel="@string/secrets_short"
+        android:shortcutLongLabel="@string/secrets_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.anypage.engine"
+            android:targetClass="com.anypage.engine.SecretsActivity" />
+    </shortcut>
+</shortcuts>

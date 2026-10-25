@@ -1,15 +1,18 @@
-//! CPU rasterisation for native operators: vector shapes through tiny-skia,
-//! glyphs through swash. tiny-skia is a spike stand-in for vello_cpu, and the
-//! greedy line breaker stands in for parley
-//! (docs/ARCHITECTURE.md section 15), chosen for API stability.
+//! CPU rasterisation for native operators: vector shapes, clips and images
+//! through tiny-skia; text through the text system (crates/anypage-text:
+//! shaping, bidi, font fallback, UAX #14 line breaking, colour emoji).
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use tiny_skia::{FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Stroke, Transform};
+pub use anypage_text::{Direction, LoadOptions as TextLoadOptions, TextSystem};
+use tiny_skia::{FillRule, LineCap, LineJoin, Mask, Paint, Path, PathBuilder, Pixmap, PixmapPaint, PixmapRef, Stroke, Transform};
 
 pub type Rgba = [u8; 4];
+
+/// The engine's text system: shaping, bidi, font fallback and line breaking
+/// for every script (crates/anypage-text). The old name stays so pages,
+/// modules and hosts keep compiling.
+pub type TextRaster = TextSystem;
 
 /// Output of a panel operator: premultiplied RGBA8.
 pub struct Image {
@@ -26,6 +29,10 @@ pub const MAX_CANVAS: u32 = 2048;
 pub struct Canvas {
     pm: Pixmap,
     scale: f32,
+    /// Clip rectangles in pixels (x0, y0, x1, y1); the effective clip is
+    /// the intersection of all of them.
+    clips: Vec<(f32, f32, f32, f32)>,
+    mask: Option<Mask>,
 }
 
 fn paint(c: Rgba) -> Paint<'static> {
@@ -64,7 +71,55 @@ impl Canvas {
         }
         let w = ((world_w * s).round() as u32).clamp(1, MAX_CANVAS);
         let h = ((world_h * s).round() as u32).clamp(1, MAX_CANVAS);
-        Self { pm: Pixmap::new(w, h).expect("pixmap"), scale: s }
+        Self { pm: Pixmap::new(w, h).expect("pixmap"), scale: s, clips: Vec::new(), mask: None }
+    }
+
+    /// Restrict drawing to a rectangle (world units), nested inside any
+    /// clip already active. Pair with [`Canvas::pop_clip`].
+    pub fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        let s = self.scale;
+        let mut r = (x * s, y * s, (x + w.max(0.0)) * s, (y + h.max(0.0)) * s);
+        if let Some(&(a, b, c, d)) = self.clips.last() {
+            r = (r.0.max(a), r.1.max(b), r.2.min(c), r.3.min(d));
+        }
+        self.clips.push(r);
+        self.rebuild_mask();
+    }
+
+    pub fn pop_clip(&mut self) {
+        self.clips.pop();
+        self.rebuild_mask();
+    }
+
+    fn rebuild_mask(&mut self) {
+        self.mask = self.clips.last().and_then(|&(x0, y0, x1, y1)| {
+            let mut m = Mask::new(self.pm.width(), self.pm.height())?;
+            if x1 > x0 && y1 > y0 {
+                let rect = tiny_skia::Rect::from_ltrb(x0, y0, x1, y1)?;
+                m.fill_path(&PathBuilder::from_rect(rect), FillRule::Winding, false, Transform::identity());
+            }
+            Some(m)
+        });
+    }
+
+    /// Integer pixel bounds glyph blits must stay inside.
+    fn clip_px(&self) -> (i32, i32, i32, i32) {
+        match self.clips.last() {
+            Some(&(x0, y0, x1, y1)) => (x0.floor() as i32, y0.floor() as i32, x1.ceil() as i32, y1.ceil() as i32),
+            None => (0, 0, self.pm.width() as i32, self.pm.height() as i32),
+        }
+    }
+
+    /// Draw a premultiplied RGBA image scaled into a rectangle (world units).
+    pub fn image(&mut self, img: &Image, x: f32, y: f32, w: f32, h: f32) {
+        let Some(src) = PixmapRef::from_bytes(&img.rgba, img.w, img.h) else { return };
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let s = self.scale;
+        let t = Transform::from_row(w * s / img.w as f32, 0.0, 0.0, h * s / img.h as f32, x * s, y * s);
+        let paint = PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
+        self.pm.draw_pixmap(0, 0, src, &paint, t, self.mask.as_ref());
     }
 
     fn t(&self) -> Transform {
@@ -78,7 +133,7 @@ impl Canvas {
     pub fn round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, c: Rgba) {
         if let Some(p) = round_rect_path(x, y, w, h, r) {
             let t = self.t();
-            self.pm.fill_path(&p, &paint(c), FillRule::Winding, t, None);
+            self.pm.fill_path(&p, &paint(c), FillRule::Winding, t, self.mask.as_ref());
         }
     }
 
@@ -86,14 +141,14 @@ impl Canvas {
         if let Some(p) = round_rect_path(x, y, w, h, r) {
             let t = self.t();
             let s = Stroke { width, ..Default::default() };
-            self.pm.stroke_path(&p, &paint(c), &s, t, None);
+            self.pm.stroke_path(&p, &paint(c), &s, t, self.mask.as_ref());
         }
     }
 
     pub fn circle(&mut self, cx: f32, cy: f32, r: f32, c: Rgba) {
         if let Some(p) = PathBuilder::from_circle(cx, cy, r.max(0.01)) {
             let t = self.t();
-            self.pm.fill_path(&p, &paint(c), FillRule::Winding, t, None);
+            self.pm.fill_path(&p, &paint(c), FillRule::Winding, t, self.mask.as_ref());
         }
     }
 
@@ -109,7 +164,7 @@ impl Canvas {
         if let Some(path) = pb.finish() {
             let t = self.t();
             let s = Stroke { width, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Default::default() };
-            self.pm.stroke_path(&path, &paint(c), &s, t, None);
+            self.pm.stroke_path(&path, &paint(c), &s, t, self.mask.as_ref());
         }
     }
 
@@ -126,38 +181,39 @@ impl Canvas {
         pb.close();
         if let Some(path) = pb.finish() {
             let t = self.t();
-            self.pm.fill_path(&path, &paint(c), FillRule::Winding, t, None);
+            self.pm.fill_path(&path, &paint(c), FillRule::Winding, t, self.mask.as_ref());
         }
     }
 
     /// Single line of text with its top at `y`. Returns the advance in units.
     pub fn text(&mut self, tr: &TextRaster, x: f32, y: f32, px: f32, c: Rgba, s: &str) -> f32 {
-        let size = px * self.scale;
-        let (ascent, _) = tr.line_metrics(size);
-        let baseline = y * self.scale + ascent;
-        let mut pen = x * self.scale;
-        for ch in s.chars() {
-            let g = tr.glyph(ch, size);
-            // placement: left from the pen, top above the baseline
-            let gx = (pen + g.left as f32).round() as i32;
-            let gy = (baseline - g.top as f32).round() as i32;
-            blit(&mut self.pm, gx, gy, g.w, g.h, &g.cov, c);
-            pen += g.advance;
-        }
-        pen / self.scale - x
+        self.text_dir(tr, x, y, px, c, s, Direction::Auto)
+    }
+
+    /// One line in a given direction (a wrapped line keeps its paragraph's).
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_dir(&mut self, tr: &TextRaster, x: f32, y: f32, px: f32, c: Rgba, s: &str, dir: Direction) -> f32 {
+        let sc = self.scale;
+        let clip = self.clip_px();
+        let (w, h) = (self.pm.width(), self.pm.height());
+        tr.draw_line_dir(self.pm.data_mut(), w, h, clip, x * sc, y * sc, px * sc, c, s, dir) / sc
     }
 
     /// Word-wrapped text inside a box. With `tail`, shows the last lines that
-    /// fit (a log that scrolls). Returns the number of lines laid out.
+    /// fit (a log that scrolls). Right-to-left paragraphs align right, and
+    /// wrapped lines keep their paragraph's direction. Returns the number of
+    /// lines laid out.
+    #[allow(clippy::too_many_arguments)]
     pub fn text_box(&mut self, tr: &TextRaster, x: f32, y: f32, w: f32, h: f32, px: f32, c: Rgba, s: &str, tail: bool) -> usize {
         let size = px * self.scale;
-        let (_, line_h) = tr.line_metrics(size);
-        let lines = tr.layout(s, size, w * self.scale);
+        let line_h = tr.line_height(size);
+        let lines = tr.layout_lines(s, size, w * self.scale);
         let fit = ((h * self.scale) / line_h).floor().max(1.0) as usize;
         let start = if tail && lines.len() > fit { lines.len() - fit } else { 0 };
-        for (i, line) in lines.iter().skip(start).take(fit).enumerate() {
+        for (i, l) in lines.iter().skip(start).take(fit).enumerate() {
             let ly = y + (i as f32 * line_h) / self.scale;
-            self.text(tr, x, ly, px, c, line);
+            let lx = if l.dir == Direction::Rtl { x + w - l.width / self.scale } else { x };
+            self.text_dir(tr, lx, ly, px, c, &s[l.range.clone()], l.dir);
         }
         lines.len()
     }
@@ -165,203 +221,5 @@ impl Canvas {
     pub fn into_image(self, newest: Option<Instant>) -> Image {
         let (w, h) = (self.pm.width(), self.pm.height());
         Image { w, h, rgba: self.pm.take(), newest }
-    }
-}
-
-fn blit(pm: &mut Pixmap, gx: i32, gy: i32, gw: usize, gh: usize, cov: &[u8], c: Rgba) {
-    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
-    let data = pm.data_mut();
-    let a = c[3] as u32;
-    for row in 0..gh as i32 {
-        let y = gy + row;
-        if y < 0 || y >= ph {
-            continue;
-        }
-        for col in 0..gw as i32 {
-            let x = gx + col;
-            if x < 0 || x >= pw {
-                continue;
-            }
-            let k = cov[row as usize * gw + col as usize] as u32;
-            if k == 0 {
-                continue;
-            }
-            let sa = k * a / 255;
-            let inv = 255 - sa;
-            let i = ((y * pw + x) * 4) as usize;
-            data[i] = (c[0] as u32 * sa / 255 + data[i] as u32 * inv / 255) as u8;
-            data[i + 1] = (c[1] as u32 * sa / 255 + data[i + 1] as u32 * inv / 255) as u8;
-            data[i + 2] = (c[2] as u32 * sa / 255 + data[i + 2] as u32 * inv / 255) as u8;
-            data[i + 3] = (sa + data[i + 3] as u32 * inv / 255) as u8;
-        }
-    }
-}
-
-struct GlyphBits {
-    left: i32,
-    top: i32,
-    w: usize,
-    h: usize,
-    advance: f32,
-    cov: Vec<u8>,
-}
-
-type Glyph = Arc<GlyphBits>;
-
-/// Glyph rasteriser on swash: TrueType, CFF and CFF2 outlines, variable fonts
-/// at their default instance (Android 15's Noto Sans CJK is a CFF2 variable font).
-pub struct TextRaster {
-    data: Vec<u8>,
-    offset: u32,
-    key: swash::CacheKey,
-    state: Mutex<(swash::scale::ScaleContext, HashMap<(char, u32), Glyph>)>,
-    pub source: String,
-}
-
-fn is_cjk(c: char) -> bool {
-    // 0x2E80..=0x9FFF already covers CJK punctuation (0x3000..=0x303F)
-    matches!(c as u32, 0x2E80..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF)
-}
-
-impl TextRaster {
-    pub fn load() -> Result<Self, String> {
-        // CJK-capable system fonts first, per platform; Latin-only last
-        let candidates = [
-            r"C:\Windows\Fonts\msjh.ttc",
-            r"C:\Windows\Fonts\msyh.ttc",
-            r"C:\Windows\Fonts\simsun.ttc",
-            "/system/fonts/NotoSansCJK-Regular.ttc",
-            "/system/fonts/NotoSansSC-Regular.otf",
-            "/system/fonts/DroidSansFallback.ttf",
-            "/System/Library/Fonts/PingFang.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            r"C:\Windows\Fonts\segoeui.ttf",
-            r"C:\Windows\Fonts\arial.ttf",
-            "/system/fonts/Roboto-Regular.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ];
-        for path in candidates {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Some(font) = swash::FontRef::from_index(&bytes, 0) else { continue };
-            if font.charmap().map('A') == 0 {
-                continue;
-            }
-            let (offset, key) = (font.offset, font.key);
-            return Ok(Self {
-                data: bytes,
-                offset,
-                key,
-                state: Mutex::new((swash::scale::ScaleContext::new(), HashMap::new())),
-                source: path.to_string(),
-            });
-        }
-        Err("no usable font found".into())
-    }
-
-    fn font(&self) -> swash::FontRef<'_> {
-        swash::FontRef { data: &self.data, offset: self.offset, key: self.key }
-    }
-
-    fn glyph(&self, ch: char, px: f32) -> Glyph {
-        let key = (ch, (px * 4.0).round() as u32);
-        let mut guard = self.state.lock().unwrap();
-        let (ctx, cache) = &mut *guard;
-        if let Some(g) = cache.get(&key) {
-            return g.clone();
-        }
-        if cache.len() > 40_000 {
-            cache.clear();
-        }
-        let font = self.font();
-        let id = font.charmap().map(ch);
-        let advance = font.glyph_metrics(&[]).scale(px).advance_width(id);
-        let mut scaler = ctx.builder(font).size(px).hint(false).build();
-        let image = swash::scale::Render::new(&[swash::scale::Source::Outline])
-            .format(swash::zeno::Format::Alpha)
-            .render(&mut scaler, id);
-        let g: Glyph = Arc::new(match image {
-            Some(img) => GlyphBits {
-                left: img.placement.left,
-                top: img.placement.top,
-                w: img.placement.width as usize,
-                h: img.placement.height as usize,
-                advance,
-                cov: img.data,
-            },
-            None => GlyphBits { left: 0, top: 0, w: 0, h: 0, advance, cov: Vec::new() },
-        });
-        cache.insert(key, g.clone());
-        g
-    }
-
-    fn advance(&self, ch: char, px: f32) -> f32 {
-        self.glyph(ch, px).advance
-    }
-
-    /// (ascent, line height) in pixels.
-    pub fn line_metrics(&self, px: f32) -> (f32, f32) {
-        let m = self.font().metrics(&[]).scale(px);
-        let (ascent, descent) = (m.ascent, m.descent.abs());
-        if ascent <= 0.0 {
-            return (px * 0.8, px * 1.25);
-        }
-        (ascent, ascent + descent + m.leading.max(0.0))
-    }
-
-    /// Greedy line breaking. CJK characters break anywhere; other text breaks
-    /// at spaces, or inside a word only when the word alone is too long.
-    pub fn layout(&self, s: &str, px: f32, max_w: f32) -> Vec<String> {
-        let mut lines = Vec::new();
-        let mut cur = String::new();
-        let mut cur_w = 0.0f32;
-        let mut segs: Vec<String> = Vec::new();
-        let mut word = String::new();
-        for ch in s.chars() {
-            if ch == '\n' || ch.is_whitespace() || is_cjk(ch) {
-                if !word.is_empty() {
-                    segs.push(std::mem::take(&mut word));
-                }
-                segs.push(ch.to_string());
-            } else {
-                word.push(ch);
-            }
-        }
-        if !word.is_empty() {
-            segs.push(word);
-        }
-        for seg in segs {
-            if seg == "\n" {
-                lines.push(std::mem::take(&mut cur));
-                cur_w = 0.0;
-                continue;
-            }
-            let w: f32 = seg.chars().map(|c| self.advance(c, px)).sum();
-            let is_space = seg.chars().all(char::is_whitespace);
-            if cur_w + w <= max_w || cur.is_empty() && w <= max_w {
-                cur.push_str(&seg);
-                cur_w += w;
-            } else if is_space {
-                lines.push(std::mem::take(&mut cur));
-                cur_w = 0.0;
-            } else if w > max_w {
-                for c in seg.chars() {
-                    let cw = self.advance(c, px);
-                    if cur_w + cw > max_w && !cur.is_empty() {
-                        lines.push(std::mem::take(&mut cur));
-                        cur_w = 0.0;
-                    }
-                    cur.push(c);
-                    cur_w += cw;
-                }
-            } else {
-                lines.push(std::mem::take(&mut cur));
-                cur.push_str(&seg);
-                cur_w = w;
-            }
-        }
-        if !cur.is_empty() {
-            lines.push(cur);
-        }
-        lines
     }
 }

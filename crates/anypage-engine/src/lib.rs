@@ -19,5 +19,8 @@ pub use wgpu;
 
 pub use engine::{Engine, EngineConfig, FrameOutcome};
 pub use gpu::Target;
-pub use page::{Class, EffectLayer, EffectParams, Page, PageRequest, PageSpec, Panel, PointerResponse, TileSource, TiledLayer};
-pub use raster::{Canvas, Image, Rgba, TextRaster};
+pub use page::{
+    Class, EffectLayer, EffectParams, GpuLayer, GpuRenderer, GpuTarget, HostResult, Page, PageRequest, PageSpec, Panel,
+    PointerResponse, TileSource, TiledLayer,
+};
+pub use raster::{Canvas, Direction, Image, Rgba, TextLoadOptions, TextRaster, TextSystem};

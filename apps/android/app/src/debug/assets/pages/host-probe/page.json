@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "id": "com.anypage.host-probe",
+  "name": "Host limits probe (debug builds only)",
+  "version": "1.0.0",
+  "entry": "main.luau",
+  "bounds": [0, 0, 720, 900],
+  "capabilities": {
+    "clipboard": true,
+    "files": true
+  },
+  "limits": {
+    "memory_mb": 64,
+    "call_ms": 200,
+    "handler_ms": 200,
+    "load_ms": 2000,
+    "job_workers": 1
+  }
+}

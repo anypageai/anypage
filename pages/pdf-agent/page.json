@@ -1,0 +1,23 @@
+{
+  "format": 1,
+  "id": "com.anypage.pdf-agent",
+  "name": "PDF 工作台 · PDF Agent Workspace",
+  "version": "1.0.0",
+  "entry": "main.luau",
+  "bounds": [0, 0, 1600, 1000],
+  "capabilities": {
+    "modules": ["pdf"],
+    "optional_modules": ["sheet", "cloud"],
+    "net": ["localhost", "127.0.0.1", "[::1]", "api.openai.com"],
+    "secrets": [{ "name": "openai", "hosts": ["api.openai.com"] }],
+    "files": true,
+    "clipboard": true
+  },
+  "limits": {
+    "memory_mb": 128,
+    "call_ms": 200,
+    "handler_ms": 1000,
+    "load_ms": 4000,
+    "job_workers": 3
+  }
+}

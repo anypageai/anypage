@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "id": "com.anypage.demo",
+  "name": "AnyPage 示範頁",
+  "version": "1.0.0",
+  "entry": "main.luau",
+  "bounds": [0, 0, 2400, 1556],
+  "capabilities": {
+    "streams": ["demo.ticks", "demo.tokens"],
+    "jobs": ["demo.compute"],
+    "tiles": ["mandelbrot"],
+    "gpu": true
+  },
+  "limits": {
+    "memory_mb": 64,
+    "call_ms": 50,
+    "handler_ms": 50,
+    "load_ms": 2000,
+    "job_workers": 6
+  }
+}

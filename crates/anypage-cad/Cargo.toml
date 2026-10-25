@@ -1,0 +1,39 @@
+[package]
+name = "anypage-cad"
+description = "CAD module: DXF read, render, measure, edit, write; STEP import to meshes"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[features]
+# STEP import is on: it is part of the module spec (cad.step_to_mesh, job
+# cad.step_mesh). Builds for Windows and Android; turn it off with
+# default-features = false to drop the truck dependency tree (see
+# CORE_REQUESTS.md for the evaluation and its limits).
+default = ["step"]
+# STEP (ISO 10303-21) solids to the shared mesh form through truck.
+step = ["dep:truck-stepio", "dep:truck-meshalgo", "dep:truck-modeling", "dep:truck-topology"]
+
+[dependencies]
+anypage-core = { path = "../anypage-core" }
+anypage-engine = { path = "../anypage-engine" }
+anypage-runtime = { path = "../anypage-runtime" }
+log = "0.4"
+# DXF parse and write (MIT)
+dxf = "0.6.2"
+# legacy DXF code pages ($DWGCODEPAGE: Big5, GBK, Shift_JIS, ...)
+encoding_rs = "0.8"
+# vector rasteriser for tiles (BSD-3); same version the engine uses
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+# glyph outlines for TEXT / MTEXT (MIT/Apache); same version the engine uses
+swash = "0.2"
+# STEP import (Apache-2.0), feature "step"; truck-modeling and -topology are
+# what truck-stepio itself builds on, used here to write test solids
+truck-stepio = { version = "0.3", optional = true }
+truck-meshalgo = { version = "0.4", optional = true }
+truck-modeling = { version = "0.6", optional = true }
+truck-topology = { version = "0.6", optional = true }
+
+[dev-dependencies]
+png = "0.17"
+serde_json = "1"

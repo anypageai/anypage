@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug builds only: tools for on-device tests (merged into the main manifest). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- A plain EditText that logs what the input method calls, to compare
+             an IME's behaviour with the engine's input connection.
+             adb shell am start -n com.anypage.engine/.ImeProbeActivity -->
+        <activity
+            android:name=".ImeProbeActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize|stateVisible" />
+    </application>
+</manifest>

@@ -1,0 +1,39 @@
+[package]
+name = "anypage-media"
+description = "Media module: HLS live playback (H.264, AAC), live broadcast to HLS, camera capture"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+# AAC-LC decode (symphonia) to the default audio output (cpal), with A/V sync
+# to the audio clock.
+audio = ["dep:symphonia", "dep:cpal"]
+# Windows camera capture through Media Foundation (Android cameras come from
+# the host through `camera::set_host_camera`).
+camera = ["dep:windows"]
+
+[dependencies]
+anypage-core = { path = "../anypage-core" }
+anypage-engine = { path = "../anypage-engine" }
+anypage-runtime = { path = "../anypage-runtime" }
+log = "0.4"
+# H.264 encode and decode, Cisco's OpenH264 compiled from source with cc (BSD-2-Clause).
+openh264 = { version = "0.9", default-features = false, features = ["source"] }
+# HLS playlists (MIT).
+m3u8-rs = "6"
+# HTTP(S) for fetching playlists and segments: rustls on ring, webpki roots (no aws-lc).
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+symphonia = { version = "0.6", default-features = false, features = ["aac"], optional = true }
+cpal = { version = "0.18", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
+
+[dev-dependencies]
+serde_json = "1"

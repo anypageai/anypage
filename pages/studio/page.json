@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "id": "com.anypage.studio",
+  "name": "AnyPage Studio 工作室",
+  "version": "1.0.0",
+  "entry": "main.luau",
+  "bounds": [0, 0, 1600, 1000],
+  "capabilities": {
+    "modules": ["cad", "sheet", "pdf"],
+    "optional_modules": ["scene"],
+    "files": true,
+    "clipboard": true
+  },
+  "limits": {
+    "memory_mb": 128,
+    "call_ms": 200,
+    "handler_ms": 1000,
+    "load_ms": 6000,
+    "job_workers": 3
+  }
+}

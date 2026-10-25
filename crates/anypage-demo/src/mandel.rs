@@ -18,7 +18,13 @@ pub struct Mandel {
 
 impl TileSource for Mandel {
     fn render(&self, key: TileKey, params: &Value, cancelled: &dyn Fn() -> bool) -> Option<Vec<u8>> {
-        let p = *params.downcast_ref::<MandelParams>()?;
+        self.render_with(key, *params.downcast_ref::<MandelParams>()?, cancelled)
+    }
+}
+
+impl Mandel {
+    /// One tile for explicit parameters (shared by the Rust and the script page).
+    pub fn render_with(&self, key: TileKey, p: MandelParams, cancelled: &dyn Fn() -> bool) -> Option<Vec<u8>> {
         let n = TILE_SIZE as usize;
         let s = level_scale(key.level) as f64;
         let r = self.rect;

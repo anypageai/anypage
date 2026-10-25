@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use anypage_engine::{Engine, Page};
 
 use crate::mandel::world_of;
-use crate::page::{DemoPage, MANDEL, RIGHT_COLUMN, JOB_COUNT};
+use crate::page::{JOB_COUNT, MANDEL, RIGHT_COLUMN};
 
 pub struct Bench {
     actions: Vec<(f64, &'static str)>,
@@ -71,7 +71,8 @@ impl Bench {
         self.actions.get(self.next).map(|a| a.0)
     }
 
-    pub fn step(&mut self, e: &mut Engine<DemoPage>, t: f64) {
+    /// Works on any page with the demo layout; actions go through `Page::control`.
+    pub fn step<P: Page>(&mut self, e: &mut Engine<P>, t: f64) {
         while let Some(&(at, name)) = self.actions.get(self.next) {
             if t < at {
                 break;
@@ -88,12 +89,12 @@ impl Bench {
                     cam.pan(vw * 0.5 - sx, vh * 0.5 - sy);
                 }
                 "edit" => {
-                    e.page_mut().set_iterations(768);
-                    e.page_mut().set_hue(320.0);
+                    e.page_mut().control("iterations", 768.0);
+                    e.page_mut().control("hue", 320.0);
                     e.mark_op();
                 }
                 "jobs" => {
-                    e.page_mut().run_jobs();
+                    e.page_mut().control("jobs", 1.0);
                     e.mark_op();
                 }
                 "right" => {
@@ -102,20 +103,20 @@ impl Bench {
                 }
                 "quiet" => {
                     let p = e.page_mut();
-                    p.set_streams(false);
-                    p.set_anim(false);
-                    p.set_timers(false);
-                    p.cancel_jobs();
+                    p.control("streams", 0.0);
+                    p.control("anim", 0.0);
+                    p.control("timers", 0.0);
+                    p.control("cancel", 1.0);
                     e.mark_op();
                 }
                 "timers" => {
-                    e.page_mut().set_timers(true);
+                    e.page_mut().control("timers", 1.0);
                     e.fit();
                 }
                 "resume" => {
                     let p = e.page_mut();
-                    p.set_streams(true);
-                    p.set_anim(true);
+                    p.control("streams", 1.0);
+                    p.control("anim", 1.0);
                     e.fit();
                 }
                 "finish" => self.done = true,
@@ -145,7 +146,7 @@ impl Bench {
         }
     }
 
-    pub fn report(&self, e: &Engine<DemoPage>) -> String {
+    pub fn report<P: Page>(&self, e: &Engine<P>, page_desc: &str) -> String {
         let s = e.stats();
         let g = e.page().graph();
         let gs = &g.stats;
@@ -158,6 +159,7 @@ impl Bench {
         let (w, h) = e.surface_size();
         let mut r = String::new();
         r += &format!("# AnyPage engine bench · {}\n\n", e.adapter_name());
+        r += &format!("- page: {page_desc}\n");
         r += &format!(
             "- backend {}, present mode {}, {} tile workers, {} job workers, surface {}x{}\n",
             e.backend(),

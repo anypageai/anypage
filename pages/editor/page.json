@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "id": "com.anypage.editor",
+  "name": "多語言編輯器 Multilingual editor",
+  "version": "1.0.0",
+  "entry": "main.luau",
+  "bounds": [0, 0, 1440, 900],
+  "capabilities": {
+    "clipboard": true,
+    "files": true
+  },
+  "limits": {
+    "memory_mb": 128,
+    "call_ms": 250,
+    "handler_ms": 250,
+    "load_ms": 3000,
+    "job_workers": 1
+  }
+}

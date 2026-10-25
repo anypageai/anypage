@@ -3,12 +3,21 @@ resolver = "2"
 members = [
     "crates/anypage-core",
     "crates/anypage-engine",
+    "crates/anypage-runtime",
     "crates/anypage-demo",
+    "crates/anypage-text",
+    "crates/anypage-ui",
+    "crates/anypage-pdf",
+    "crates/anypage-sheet",
+    "crates/anypage-cad",
+    "crates/anypage-cloud",
+    "crates/anypage-media",
+    "crates/anypage-devices",
+    "crates/anypage-scene",
+    "crates/anypage-std",
     "apps/desktop",
     "apps/android",
 ]
-# PDF importer is parked; the engine is not PDF-first.
-exclude = ["crates/anypage-pdf"]
 
 [workspace.package]
 version = "0.0.1"
@@ -18,7 +27,18 @@ publish = false
 [workspace.dependencies]
 anypage-core = { path = "crates/anypage-core" }
 anypage-engine = { path = "crates/anypage-engine" }
+anypage-runtime = { path = "crates/anypage-runtime" }
 anypage-demo = { path = "crates/anypage-demo" }
+anypage-text = { path = "crates/anypage-text" }
+anypage-ui = { path = "crates/anypage-ui" }
+anypage-pdf = { path = "crates/anypage-pdf" }
+anypage-sheet = { path = "crates/anypage-sheet" }
+anypage-cad = { path = "crates/anypage-cad" }
+anypage-cloud = { path = "crates/anypage-cloud" }
+anypage-media = { path = "crates/anypage-media" }
+anypage-devices = { path = "crates/anypage-devices" }
+anypage-scene = { path = "crates/anypage-scene" }
+anypage-std = { path = "crates/anypage-std" }
 
 # Pinned to API generations known to work together.
 # wgpu 30 is current upstream; upgrading is a deliberate, separate step.
@@ -30,6 +50,9 @@ memory-stats = "1"
 tiny-skia = "0.11"
 swash = "0.2"
 log = "0.4"
+# Page scripts: Luau (sandboxed Lua dialect), compiled from source inside the app.
+mlua = { version = "0.12", features = ["luau", "send"] }
+serde_json = "1"
 
 # Keep `target/` small (docs/ARCHITECTURE.md section 16) and dependencies fast even in dev.
 [profile.dev]

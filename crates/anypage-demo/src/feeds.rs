@@ -71,7 +71,7 @@ pub fn spawn_ticks(p: StreamProducer<Tick>, on: Arc<AtomicBool>, quit: Arc<Atomi
         .expect("spawn ticks")
 }
 
-const CORPUS: &[&str] = &[
+pub const CORPUS: &[&str] = &[
     "AnyPage 把靜態、流式、非同步與操作中的內容放進同一個頁面。",
     "每一種內容都是計算圖上的一個格，差別只在它什麼時候會變。",
     "The scheduler fills each frame's budget: operations first, then visible streams, then async results.",

@@ -45,6 +45,8 @@ pub struct EffectUniform {
 pub enum TexKey {
     Tile(u16, TileKey),
     Panel(u32),
+    /// Offscreen target of a page's GPU layer.
+    Layer(u32),
     Hud,
 }
 
@@ -319,7 +321,10 @@ impl Gpu {
     }
 
     /// Compile a page-supplied GPU operator. Returns its index for `Draw::Effect`.
-    pub fn add_effect(&mut self, wgsl: &str) -> usize {
+    /// Build a page's GPU operator. A shader the device rejects is an error
+    /// for that operator only; it must never take the engine down.
+    pub fn add_effect(&mut self, wgsl: &str) -> Result<usize, String> {
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("page effect"),
             source: wgpu::ShaderSource::Wgsl(wgsl.into()),
@@ -341,9 +346,15 @@ impl Gpu {
             multiview: None,
             cache: None,
         });
+        if let Some(err) = pollster::block_on(self.device.pop_error_scope()) {
+            return Err(match err {
+                wgpu::Error::Validation { description, .. } => description,
+                other => other.to_string(),
+            });
+        }
         let (buf, bg) = uniform_buffer(&self.device, &self.fx_layout, std::mem::size_of::<EffectUniform>() as u64, "effect params");
         self.effects.push(EffectGpu { pipeline, buf, bg });
-        self.effects.len() - 1
+        Ok(self.effects.len() - 1)
     }
 
     pub fn has_surface(&self) -> bool {
@@ -432,6 +443,65 @@ impl Gpu {
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
+    }
+
+    /// Largest texture side this device accepts.
+    pub fn max_texture(&self) -> u32 {
+        self.device.limits().max_texture_dimension_2d
+    }
+
+    /// Run a page GPU layer's renderer into its offscreen texture, creating
+    /// or resizing the texture as needed. The texture is then drawn with
+    /// `Draw::Quads` like a panel.
+    pub fn render_layer(&mut self, key: TexKey, w: u32, h: u32, ver: u64, renderer: &dyn crate::page::GpuRenderer, value: &anypage_core::Value) -> Result<(), String> {
+        let reuse = matches!(self.textures.get(&key), Some(t) if t.w == w && t.h == h);
+        if !reuse {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("gpu layer"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: TEX_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.tex_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            });
+            self.textures.insert(key, GpuTex { texture, bind_group, w, h, ver, last_used: self.frame, pinned: true });
+        }
+        let t = self.textures.get_mut(&key).expect("layer texture");
+        t.ver = ver;
+        t.last_used = self.frame;
+        let view = t.texture.create_view(&Default::default());
+        // a renderer's mistakes (invalid use, out of memory, a panic) cost
+        // only its own layer, never the engine
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        self.device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let target = crate::page::GpuTarget { device: &self.device, queue: &self.queue, view: &view, format: TEX_FORMAT, size: (w, h) };
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| renderer.render(&target, value)))
+            .unwrap_or_else(|_| Err("the layer's renderer panicked".into()));
+        let mut first_err = None;
+        for _ in 0..3 {
+            if let Some(err) = pollster::block_on(self.device.pop_error_scope()) {
+                first_err.get_or_insert(match err {
+                    wgpu::Error::Validation { description, .. } => description,
+                    other => other.to_string(),
+                });
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => r,
+        }
     }
 
     pub fn tile_count_and_bytes(&self) -> (usize, usize) {

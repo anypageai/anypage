@@ -1,6 +1,6 @@
 [package]
 name = "anypage-demo"
-description = "Built-in demo page: every kind of timing on one page, plus the scripted bench"
+description = "Demo page (in Rust and as a Luau package), the native operators it uses, and the scripted bench"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -8,3 +8,4 @@ publish.workspace = true
 [dependencies]
 anypage-core = { workspace = true }
 anypage-engine = { workspace = true }
+anypage-runtime = { workspace = true }

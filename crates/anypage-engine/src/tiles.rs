@@ -65,7 +65,10 @@ impl TileSystem {
                         // stop work that is many parameter versions behind
                         let latest = &sh.latest[layer];
                         let stale = || latest.load(Ordering::Relaxed) > req.ver.saturating_add(8);
-                        let rgba = params.and_then(|p| sh.sources[layer].render(req.key, &p, &stale));
+                        // a tile source that panics loses that tile, not the worker
+                        let rgba = params.and_then(|p| {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sh.sources[layer].render(req.key, &p, &stale))).unwrap_or(None)
+                        });
                         let ms = t.elapsed().as_secs_f32() * 1000.0;
                         if tx.send(TileDone { req, rgba, ms }).is_err() {
                             break;

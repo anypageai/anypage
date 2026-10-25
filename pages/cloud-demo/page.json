@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "id": "com.anypage.cloud-demo",
+  "name": "雲端串流聊天示範",
+  "version": "1.0.0",
+  "entry": "main.luau",
+  "bounds": [0, 0, 1200, 860],
+  "capabilities": {
+    "modules": ["cloud"],
+    "net": ["localhost", "127.0.0.1", "api.openai.com"],
+    "secrets": ["openai"],
+    "clipboard": true
+  },
+  "limits": {
+    "memory_mb": 64,
+    "call_ms": 50,
+    "handler_ms": 50,
+    "load_ms": 2000,
+    "job_workers": 2
+  }
+}

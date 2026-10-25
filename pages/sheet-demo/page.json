@@ -1,0 +1,20 @@
+{
+  "format": 1,
+  "id": "com.anypage.sheet-demo",
+  "name": "AnyPage 試算表示範",
+  "version": "1.0.0",
+  "entry": "main.luau",
+  "bounds": [0, 0, 1280, 828],
+  "capabilities": {
+    "modules": ["sheet"],
+    "files": true,
+    "clipboard": true
+  },
+  "limits": {
+    "memory_mb": 128,
+    "call_ms": 200,
+    "handler_ms": 1000,
+    "load_ms": 4000,
+    "job_workers": 2
+  }
+}

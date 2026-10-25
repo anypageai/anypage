@@ -9,11 +9,23 @@ publish.workspace = true
 name = "anypage_android"
 crate-type = ["cdylib"]
 
-# On every other target this crate compiles to an empty library.
-[target.'cfg(target_os = "android")'.dependencies]
+# Key names, page packages, file reading, the device-bridge codec and the
+# camera hub are plain Rust and build (and are tested) on every target; the
+# JNI host itself exists only on Android.
+[dependencies]
 anypage-engine = { workspace = true }
+anypage-runtime = { workspace = true }
 anypage-demo = { workspace = true }
+anypage-std = { workspace = true }
+# The host implements their Android bridges (anypage_devices::AndroidDevices,
+# anypage_media::camera::HostCamera); both are already linked through anypage-std.
+anypage-devices = { workspace = true }
+anypage-media = { workspace = true }
 log = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 ndk = "0.9"
 android_logger = "0.14"
+# Lets crates that look up the JVM themselves (cpal's AAudio output) find it.
+ndk-context = "0.1"

@@ -23,7 +23,7 @@ use anypage_core::{
 };
 
 use crate::gpu::{CameraUniform, Draw, EffectUniform, Gpu, Target, TexKey, Vertex};
-use crate::page::{Class, EffectParams, Page, PageRequest, PointerResponse};
+use crate::page::{Class, EffectParams, HostResult, Page, PageRequest, PointerResponse};
 use crate::raster::{Canvas, Image, TextRaster};
 use crate::stats::{rss_mb, Stats};
 use crate::tiles::{TileReq, TileSystem};
@@ -42,7 +42,8 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Self { vsync: true, tile_workers: cpus.saturating_sub(2).clamp(2, 24), tile_budget_mb: 256, frame_budget_ms: 10.0, show_hud: true }
+        // the measurement panel is for development: hosts turn it on (h toggles it)
+        Self { vsync: true, tile_workers: cpus.saturating_sub(2).clamp(2, 24), tile_budget_mb: 256, frame_budget_ms: 10.0, show_hud: false }
     }
 }
 
@@ -74,7 +75,8 @@ pub struct Engine<P: Page> {
     tiles: TileSystem,
     text: Arc<TextRaster>,
     stats: Stats,
-    effects: Vec<usize>,
+    /// GPU pipeline per page effect; `None` if the device rejected its shader.
+    effects: Vec<Option<usize>>,
     effect_versions: Vec<u64>,
     pointers: Vec<(u64, f32, f32)>,
     mode: Mode,
@@ -96,6 +98,12 @@ pub struct Engine<P: Page> {
     next_desc: String,
     /// The previous frame was part of back-to-back drawing (animation or camera motion).
     prev_moving: bool,
+    /// (cell version, pixel size) each GPU layer was last rendered at.
+    layer_drawn: HashMap<u32, (u64, u32, u32)>,
+    /// Requests only the host can serve (clipboard, file dialogs).
+    host_requests: Vec<PageRequest>,
+    /// Last pointer position, for hover.
+    hover: (f32, f32),
 }
 
 fn push_quad(verts: &mut Vec<Vertex>, r: Rect, uv: [f32; 4]) -> std::ops::Range<u32> {
@@ -117,13 +125,25 @@ impl<P: Page> Engine<P> {
     pub fn new(target: &Target, size: (u32, u32), scale_factor: f32, page: P, text: Arc<TextRaster>, wake: Wake, cfg: EngineConfig) -> Result<Self, String> {
         let start = Instant::now();
         let mut gpu = Gpu::new(target, size.0, size.1, cfg.vsync, cfg.tile_budget_mb << 20)?;
-        let effects: Vec<usize> = page.spec().effects.iter().map(|e| gpu.add_effect(&e.wgsl)).collect();
+        let effects: Vec<Option<usize>> = page
+            .spec()
+            .effects
+            .iter()
+            .enumerate()
+            .map(|(k, e)| match gpu.add_effect(&e.wgsl) {
+                Ok(i) => Some(i),
+                Err(err) => {
+                    log::warn!("GPU operator {k} disabled: {}", err.lines().map(str::trim).filter(|l| !l.is_empty()).take(6).collect::<Vec<_>>().join(" | "));
+                    None
+                }
+            })
+            .collect();
         let tiles = TileSystem::new(&page.spec().tiled, wake, cfg.tile_workers);
         let (w, h) = gpu.size();
         let mut camera = Camera::new(w as f32, h as f32);
         camera.fit_rect(page.spec().bounds, 24.0 * scale_factor);
         let n_fx = effects.len();
-        let engine = Self {
+        let mut engine = Self {
             gpu,
             page,
             camera,
@@ -150,9 +170,22 @@ impl<P: Page> Engine<P> {
             last: FrameOutcome::default(),
             next_desc: String::new(),
             prev_moving: false,
+            layer_drawn: HashMap::new(),
+            host_requests: Vec::new(),
+            hover: (0.0, 0.0),
         };
         log::info!("{}", engine.summary());
+        engine.notify_viewport();
         Ok(engine)
+    }
+
+    /// Tell the page the window size in logical pixels, so it can pick a
+    /// layout (and fit it with `page.fit_rect`).
+    fn notify_viewport(&mut self) {
+        let (w, h) = self.gpu.size();
+        let s = self.scale_factor.max(0.1);
+        self.page.viewport(w as f32 / s, h as f32 / s, s);
+        self.drain_requests();
     }
 
     // ------------------------------------------------------------ host API
@@ -230,16 +263,19 @@ impl<P: Page> Engine<P> {
         self.gpu.resize(w, h);
         self.camera.set_viewport(w as f32, h as f32);
         self.camera_dirty = true;
+        self.notify_viewport();
     }
     pub fn set_scale_factor(&mut self, f: f32) {
         self.scale_factor = f.max(0.5);
         self.hud_at = self.start;
         self.camera_dirty = true;
+        self.notify_viewport();
     }
     pub fn attach_surface(&mut self, target: &Target, w: u32, h: u32) -> Result<(), String> {
         self.gpu.attach_surface(target, w, h)?;
         self.camera.set_viewport(w as f32, h as f32);
         self.camera_dirty = true;
+        self.notify_viewport();
         Ok(())
     }
     pub fn detach_surface(&mut self) {
@@ -267,9 +303,60 @@ impl<P: Page> Engine<P> {
 
     fn after_input(&mut self) {
         self.mark_op();
-        if let Some(PageRequest::FitPage) = self.page.take_request() {
-            self.fit();
+        self.drain_requests();
+    }
+
+    fn drain_requests(&mut self) {
+        while let Some(r) = self.page.take_request() {
+            match r {
+                PageRequest::FitPage => self.fit(),
+                PageRequest::FitRect(rect) => self.fit_rect(rect),
+                other => self.host_requests.push(other),
+            }
         }
+    }
+
+    /// Clipboard and file requests from the page, for the host to serve.
+    pub fn take_host_request(&mut self) -> Option<PageRequest> {
+        self.drain_requests();
+        if self.host_requests.is_empty() {
+            None
+        } else {
+            Some(self.host_requests.remove(0))
+        }
+    }
+
+    /// Where the page's caret is on screen (physical pixels: x, y, w, h)
+    /// while it wants text input; `None` otherwise.
+    pub fn text_focus(&self) -> Option<(f32, f32, f32, f32)> {
+        let r = self.page.text_focus()?;
+        if ![r.x, r.y, r.w, r.h].iter().all(|v| v.is_finite() && v.abs() < 1.0e9) {
+            return None;
+        }
+        let (x0, y0) = self.camera.world_to_screen(r.x, r.y);
+        let (x1, y1) = self.camera.world_to_screen(r.right(), r.bottom());
+        Some((x0, y0, (x1 - x0).max(1.0), (y1 - y0).max(1.0)))
+    }
+
+    pub fn text_input(&mut self, text: &str) {
+        self.page.text_input(text);
+        self.after_input();
+    }
+    pub fn ime_preedit(&mut self, text: &str) {
+        self.page.ime_preedit(text);
+        self.after_input();
+    }
+    pub fn paste(&mut self, text: &str) {
+        self.page.paste(text);
+        self.after_input();
+    }
+    pub fn file_drop(&mut self, name: &str, bytes: Arc<Vec<u8>>) {
+        self.page.file_drop(name, bytes);
+        self.after_input();
+    }
+    pub fn host_result(&mut self, id: u64, result: HostResult) {
+        self.page.host_result(id, result);
+        self.after_input();
     }
 
     /// Physical pixels. Mouse buttons and touch points both come through here.
@@ -287,7 +374,7 @@ impl<P: Page> Engine<P> {
             }
             2 => {
                 if matches!(self.mode, Mode::Page) {
-                    self.page.pointer_up();
+                    self.page.pointer_cancel();
                 }
                 let (dist, mid) = self.pinch_metrics();
                 self.mode = Mode::Pinch { dist, mid };
@@ -298,7 +385,16 @@ impl<P: Page> Engine<P> {
     }
 
     pub fn pointer_move(&mut self, id: u64, x: f32, y: f32) {
-        let Some(k) = self.pointers.iter().position(|p| p.0 == id) else { return };
+        let Some(k) = self.pointers.iter().position(|p| p.0 == id) else {
+            // no button held: hover
+            if self.pointers.is_empty() && (x, y) != self.hover {
+                self.hover = (x, y);
+                let (wx, wy) = self.camera.screen_to_world(x, y);
+                self.page.pointer_move(wx, wy);
+                self.drain_requests();
+            }
+            return;
+        };
         let (_, px, py) = self.pointers[k];
         self.pointers[k] = (id, x, y);
         match self.mode {
@@ -343,33 +439,43 @@ impl<P: Page> Engine<P> {
 
     pub fn pointer_cancel(&mut self) {
         if matches!(self.mode, Mode::Page) {
-            self.page.pointer_up();
+            self.page.pointer_cancel();
         }
         self.pointers.clear();
         self.mode = Mode::Idle;
     }
 
-    /// Zoom by `factor` around a screen point (mouse wheel, trackpad).
-    pub fn wheel(&mut self, x: f32, y: f32, factor: f32) {
-        self.camera.zoom_at(x, y, factor);
-        self.camera_dirty = true;
+    /// Mouse wheel or trackpad scroll at a screen point, in lines (positive
+    /// `dy` = wheel up). The page may consume it (a scrolling list);
+    /// otherwise it zooms the camera.
+    pub fn wheel(&mut self, x: f32, y: f32, dx: f32, dy: f32) {
+        let (wx, wy) = self.camera.screen_to_world(x, y);
+        if !self.page.wheel(wx, wy, dx, dy) {
+            self.camera.zoom_at(x, y, 1.15f32.powf(dy));
+            self.camera_dirty = true;
+        }
         self.after_input();
     }
 
-    /// Lower-case key names. Engine keys: "h" HUD, "r" fit. The rest go to the page.
+    /// Key names as in [`Page::key`]. The page sees every key first; the
+    /// engine's own keys ("h" HUD, "r" fit) apply only if the page did not
+    /// take the key and is not editing text.
     pub fn key(&mut self, name: &str) -> bool {
-        let handled = match name {
-            "h" => {
-                self.hud_visible = !self.hud_visible;
-                self.camera_dirty = true;
-                true
-            }
-            "r" => {
-                self.fit();
-                true
-            }
-            _ => self.page.key(name),
-        };
+        let mut handled = self.page.key(name);
+        if !handled && self.page.text_focus().is_none() {
+            handled = match name {
+                "h" => {
+                    self.hud_visible = !self.hud_visible;
+                    self.camera_dirty = true;
+                    true
+                }
+                "r" => {
+                    self.fit();
+                    true
+                }
+                _ => false,
+            };
+        }
         self.after_input();
         handled
     }
@@ -389,15 +495,18 @@ impl<P: Page> Engine<P> {
         let view = self.camera.visible_world();
         let level = level_for_scale(self.camera.scale);
 
-        let (panels, effects, layers, cam_cell) = {
+        let (panels, effects, layers, gpu_layers, cam_cell) = {
             let spec = self.page.spec();
             let panels: Vec<PanelInfo> = spec.panels.iter().map(|p| (p.id, p.rect, p.cell, p.class, p.priority, p.over_effects)).collect();
             let effects: Vec<(Rect, CellId)> = spec.effects.iter().map(|e| (e.rect, e.params)).collect();
             let layers: Vec<(Rect, CellId)> = spec.tiled.iter().map(|l| (l.rect, l.params)).collect();
-            (panels, effects, layers, spec.camera_level)
+            let gpu_layers: Vec<(u32, Rect, CellId, Arc<dyn crate::page::GpuRenderer>)> =
+                spec.layers.iter().map(|l| (l.id, l.rect, l.cell, l.renderer.clone())).collect();
+            (panels, effects, layers, gpu_layers, spec.camera_level)
         };
         let mut sinks: Vec<CellId> = Vec::new();
         sinks.extend(panels.iter().filter(|p| p.1.intersects(&view)).map(|p| p.2));
+        sinks.extend(gpu_layers.iter().filter(|l| l.1.intersects(&view)).map(|l| l.2));
         sinks.extend(effects.iter().filter(|e| e.0.intersects(&view)).map(|e| e.1));
         sinks.extend(layers.iter().filter(|l| l.0.intersects(&view)).map(|l| l.1));
 
@@ -420,6 +529,13 @@ impl<P: Page> Engine<P> {
         if self.pending_async.len() > 256 {
             self.pending_async.clear();
         }
+        // let the page react to finished jobs and new stream items
+        if !rep.completed.is_empty() || !rep.streams_changed.is_empty() {
+            let ids: Vec<CellId> = rep.completed.iter().map(|c| c.0).collect();
+            self.page.after_commit(&ids);
+            self.drain_requests();
+        }
+        let graph = self.page.parts().0;
 
         let camera_moved = self.camera_dirty;
         let mut changed = self.camera_dirty || self.first;
@@ -461,6 +577,37 @@ impl<P: Page> Engine<P> {
             }
         }
 
+        // GPU layers: native renderers into cached offscreen textures, redrawn
+        // only when their value or their size on screen changed
+        let max_tex = self.gpu.max_texture().min(4096) as f32;
+        let mut layers_shown: Vec<(u32, Rect)> = Vec::new();
+        for (id, rect, cell, renderer) in &gpu_layers {
+            if !rect.intersects(&view) {
+                continue;
+            }
+            let graph = self.page.parts().0;
+            let inp = match graph.demand_until(*cell, deadline) {
+                Some(i) => i,
+                None => {
+                    deferred = true;
+                    continue;
+                }
+            };
+            let Some(value) = inp.value.clone() else { continue };
+            let s = (self.camera.scale * (max_tex / (rect.w * self.camera.scale)).min(max_tex / (rect.h * self.camera.scale)).min(1.0)).max(0.01);
+            let (pw, ph) = (((rect.w * s).round() as u32).max(1), ((rect.h * s).round() as u32).max(1));
+            if self.layer_drawn.get(id) != Some(&(inp.version, pw, ph)) {
+                match self.gpu.render_layer(TexKey::Layer(*id), pw, ph, inp.version, renderer.as_ref(), &value) {
+                    Ok(()) => {}
+                    Err(e) => log::warn!("GPU layer {id}: {}", e.lines().next().unwrap_or("")),
+                }
+                self.layer_drawn.insert(*id, (inp.version, pw, ph));
+                changed = true;
+            }
+            layers_shown.push((*id, *rect));
+        }
+        let graph = self.page.parts().0;
+
         // GPU operators: the cell holds the uniforms, the compositor runs the shader
         let mut fx_uniforms: Vec<(usize, EffectUniform)> = Vec::new();
         for (k, (rect, cell)) in effects.iter().enumerate() {
@@ -473,7 +620,9 @@ impl<P: Page> Engine<P> {
                 self.effect_versions[k] = inp.version;
                 changed = true;
             }
-            fx_uniforms.push((self.effects[k], EffectUniform { rect: [rect.x, rect.y, rect.w, rect.h], p: p.0 }));
+            if let Some(fx) = self.effects[k] {
+                fx_uniforms.push((fx, EffectUniform { rect: [rect.x, rect.y, rect.w, rect.h], p: p.0 }));
+            }
         }
 
         // tiles: finished ones first (budgeted), then what is wanted now
@@ -488,8 +637,16 @@ impl<P: Page> Engine<P> {
                 }
             }
         }
+        // Always take some finished tiles, even when the frame is over budget:
+        // their wake-up was already spent, so results left in the channel
+        // would wait for the next input. If more may be waiting, ask for
+        // another frame.
         let mut uploads = 0;
-        while uploads < 64 && Instant::now() < deadline + Duration::from_millis(3) {
+        loop {
+            if uploads >= 64 || (uploads >= 8 && Instant::now() >= deadline + Duration::from_millis(3)) {
+                deferred = true;
+                break;
+            }
             let Ok(done) = self.tiles.rx.try_recv() else { break };
             self.tiles.queue.complete(done.req);
             let Some(rgba) = done.rgba else { continue };
@@ -621,6 +778,12 @@ impl<P: Page> Engine<P> {
                         }
                     }
                 }
+            }
+        }
+        for (id, rect) in &layers_shown {
+            if self.gpu.tex(&TexKey::Layer(*id)).is_some() {
+                let range = push_quad(&mut verts, *rect, [0.0, 0.0, 1.0, 1.0]);
+                draws.push(Draw::Quads { key: TexKey::Layer(*id), range, screen: false });
             }
         }
         for over in [false, true] {

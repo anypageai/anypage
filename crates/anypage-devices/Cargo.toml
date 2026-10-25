@@ -1,0 +1,31 @@
+[package]
+name = "anypage-devices"
+description = "Device module: Bluetooth LE, USB, serial ports"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+anypage-core = { path = "../anypage-core" }
+anypage-engine = { path = "../anypage-engine" }
+anypage-runtime = { path = "../anypage-runtime" }
+log = "0.4"
+uuid = "1"
+
+# Windows: real backends. btleplug (WinRT Bluetooth LE, driven by a tokio
+# runtime on one background thread), nusb (WinUSB), serialport (COM ports).
+[target.'cfg(windows)'.dependencies]
+btleplug = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+nusb = "0.2"
+serialport = { version = "4", default-features = false }
+
+# Android: the Kotlin host lists devices and asks for permission over the
+# bridge (src/android.rs); USB transfers then run natively on the file
+# descriptor it hands over, through nusb's usbfs backend.
+[target.'cfg(target_os = "android")'.dependencies]
+nusb = "0.2"
+
+[dev-dependencies]
+serde_json = "1"

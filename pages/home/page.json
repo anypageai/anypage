@@ -1,0 +1,18 @@
+{
+  "format": 1,
+  "id": "com.anypage.home",
+  "name": "AnyPage 首頁",
+  "version": "1.0.0",
+  "entry": "main.luau",
+  "bounds": [0, 0, 1440, 900],
+  "capabilities": {
+    "optional_modules": ["pdf", "sheet", "cad", "scene", "media", "cloud", "ble", "usb", "serial", "demo"]
+  },
+  "limits": {
+    "memory_mb": 32,
+    "call_ms": 50,
+    "handler_ms": 50,
+    "load_ms": 2000,
+    "job_workers": 1
+  }
+}

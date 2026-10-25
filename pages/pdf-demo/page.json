@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "id": "com.anypage.pdf-demo",
+  "name": "AnyPage PDF",
+  "version": "1.0.0",
+  "entry": "main.luau",
+  "bounds": [0, 0, 1520, 900],
+  "capabilities": {
+    "modules": ["pdf"],
+    "files": true
+  },
+  "limits": {
+    "memory_mb": 64,
+    "call_ms": 200,
+    "handler_ms": 500,
+    "load_ms": 4000,
+    "job_workers": 2
+  }
+}

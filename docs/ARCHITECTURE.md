@@ -281,10 +281,12 @@ v1 的結論是「每幀工作全放進這兩個例外，腳本層只處理事�
 | 內容 | 語言 | 為什麼 |
 |---|---|---|
 | manifest、權限、圖範本、靜態 UI | JSON（帶 schema） | 可驗證、可 diff，AI 不會寫錯語法；靜態部分的動作空間發佈時就編好 |
-| 邏輯 | Luau 位元碼（或 TypeScript 編譯而來） | 裝置只收位元碼，見第 11 節 |
+| 邏輯 | Luau 原始碼（或 TypeScript 編譯而來） | 現階段裝置收原始碼、在 App 內編譯，拒收位元碼；日後改收位元碼必須先有簽章，見第 11、13 節 |
 | GPU | WGSL | 經 naga 轉 MSL / SPIR-V / HLSL，各平台原生速度 |
 | 資產 | 圖片、字型、資料 | 內容定址，可快取 |
-| 簽章 | 發佈者簽章 | Luau 沙盒規範要求跨信任邊界的位元碼必須簽章 |
+| 簽章 | 發佈者簽章 | 驗證頁面來源；若日後跨信任邊界傳位元碼，Luau 沙盒規範要求簽章 |
+
+現況（2026-10-24）：`pages/demo` 就是一個頁面包：`page.json`（身分、頁面邊界、能力宣告、配額）、`main.luau`、`plasma.wgsl`。只收文字檔，檔名不得含路徑，單檔 2 MB、全包 16 MB。能力宣告列出頁面要用的原生算子（串流、工作、tile 來源）與能否帶 WGSL，沒宣告的在載入時就被拒。圖範本還沒有獨立成 JSON，目前由入口腳本在載入時建圖。實作在 `crates/anypage-runtime`，量測在 docs/spikes/spike2-script-pages.md。
 
 內建頁面（設定、檔案總管、各格式的預設處理器）用同一格式隨 App 出廠，**沒有特權**。核心因此沒有任何「只有內建功能才能做」的後門。
 
@@ -313,7 +315,7 @@ v1 的結論是「每幀工作全放進這兩個例外，腳本層只處理事�
 ## 6. 層級
 
 ```
-L4  頁面      manifest + 圖範本 + Luau 位元碼 + WGSL + 資產 + 簽章（含內建處理器頁面）  可下載、可熱換
+L4  頁面      manifest + 圖範本 + Luau（現為原始碼）+ WGSL + 資產 + 簽章（含內建處理器頁面）  可下載、可熱換
 L3  腳本 VM   Luau，每頁一個 realm：建圖、處理事件、發指令；只拿到能力物件            編進 App
 L2  算子庫    佈局、排版、光柵、解碼、格式匯入匯出、公式、幾何；宣告簽章與執行緒契約    編進 App，C ABI
 L1  執行時    計算圖求值器、排程、commit 與快照、指令日誌、渲染器、能力代理、語義埠、頁面載入器
@@ -430,6 +432,19 @@ Emacs（C + Elisp）、Blender（C + Python + 幾何節點）、Roblox（C++ + L
 
 一次剪輯操作：點擊 → 命中測試（快照）→ 事件處理器把 `timeline.split(clip, t)` 寫進緩衝 → commit → 時間軸輸入格更新，兩個片段的導出格變髒 → 下一幀只重算受影響的合成 → GPU。腳本耗時微秒級。
 
+**現況（2026-10-24，spike 2）。** 已實作的是這個接口的第一版，全部在全域 `page` 上：
+
+| 時機 | 呼叫 |
+|---|---|
+| 只在載入時（之後圖固定） | `page.clock()`、`page.input(name, v)`、`page.derive(name, {輸入}, fn)`、`page.stream(name, 來源, opts)`、`page.job(name, 來源, {輸入})`、`page.panel{rect, class, inputs, draw}`、`page.tiled{rect, source, params}`、`page.effect{rect, shader, params}` |
+| 事件處理器 | `page.on(事件, fn)`；`page.set`、`page.cancel`、`page.request` 先記下，處理器結束後一次套用；`page.get` 讀輸入格的最新值 |
+
+- 句柄是 userdata 包著格的 id；值以一個可比較的資料型別在腳本與核心之間轉換，所以腳本算子的結果能做提早截斷。
+- 腳本算子回傳第二個值宣告「有效到」（第 4.8 節）；面板的 `draw` 回傳顯示清單而不是像素，光柵化在原生程式裡做，換縮放級距不重跑腳本。
+- 尚未就緒的輸入以 `{ state = "pending", progress }`、`{ state = "error", message }` 交給腳本。
+- 主機函式的錯誤帶呼叫它的腳本行號；出錯的面板畫錯誤訊息，頁面其餘部分照常。
+- 還沒做：`remove` 與 `connect`、資源呼叫、同步查詢只有 `page.measure` 與輸入格的 `page.get`、共享緩衝。
+
 ---
 
 ## 11. VM 的決定：先定 VM，表面語言可以晚定
@@ -445,6 +460,8 @@ VM 選 **Luau**：
 - 漸進型別讓發佈前的靜態檢查成立。
 
 現況（2026-10）：mlua 0.12 的 `luau` 特性直接提供 `sandbox()`、`set_interrupt()`、`set_memory_limit()`、`heap_dump()`。兩個坑：`interrupt` 在單一大型內建函式內不會觸發（例如 `string.rep`），要另外限制字串長度或移除這類內建；位元碼跨信任邊界必須簽章。Rive 於 2026-01 把 Luau 當 .riv 檔內的腳本語言正式上線，證明這條路在 iOS / Android / Web 上可出貨。
+
+實測（2026-10-24，spike 2）：mlua 0.12.2 的 `luau` + `send` 特性在 Windows 與 Android（arm64、x86_64）都能編譯與執行。每頁一個 realm：預設 64 MB 記憶體上限；每次腳本函數呼叫 50 ms 期限，`interrupt` 每 128 次檢查一次時鐘，無窮迴圈 20 ms 內停下且 VM 之後仍可用；`sandbox(true)` 之後全域與標準庫唯讀；`loadstring`、`load`、`require`、`getfenv`、`setfenv` 移除；只收原始碼（`ChunkMode::Text`）。`string.rep` 這類不觸發 `interrupt` 的大型內建函式，靠記憶體上限擋住。示範頁面建 realm 加執行入口腳本：Windows 3.0 ms，Android 模擬器冷啟動 85.9 ms。Android 上 Luau 的 C++ 執行時改為靜態連結，App 仍只有一個原生函式庫。
 
 代價：Web 上 Luau 跑在 WASM 裡再直譯，比直接跑瀏覽器 JS 慢；AI 寫 Lua 的熟練度低於 TS，但 API 面小、型別標注齊全時差距不大。之後要 TS 表面，roblox-ts 已證明 TS→Luau 能在生產規模運作。
 
@@ -517,7 +534,8 @@ Computer use 要看截圖、算座標，是因為它面對別人的 App。我們
 - **回合即交易**：一個 agent 回合的所有指令是一組，可一鍵撤銷。
 - **審計就是指令日誌。**
 - **像素通道遮蔽**：`NativeOverlay`（密碼框）與敏感節點在給 agent 的圖裡遮掉。
-- **隔離邊界**：下載的程式碼永遠是被直譯的位元碼或 GPU shader，從不是原生碼。原生算子全部隨 App 出廠、經過審查。這是單一行程裡能成立的邊界。
+- **隔離邊界**：下載的程式碼永遠是被直譯的腳本或 GPU shader，從不是原生碼。原生算子全部隨 App 出廠、經過審查。這是單一行程裡能成立的邊界。
+- **頁面的著色器不能拖垮引擎**：載入時先用 naga 解析與驗證，並檢查入口點；建管線時再包一層 wgpu 錯誤範圍，失敗只停用那個效果。實測過：沒有這兩層時，一個語法錯誤的 WGSL 會讓整個 App panic（2026-10-24）。
 
 ---
 
@@ -554,7 +572,7 @@ Computer use 要看截圖、算座標，是因為它面對別人的 App。我們
 | 無障礙 | AccessKit UIA | AccessKit macOS；iOS 只有基本版 | AccessKit AT-SPI | AccessKit Android | 語義樹鏡像成隱藏 DOM | 只有草稿，需自建 |
 | 硬體解碼 | Media Foundation（D3D11 DXVA）→ 共享句柄 → wgpu | VideoToolbox | VA-API（cros-codecs）或 Vulkan Video（gpu-video，H.264） | MediaCodec（ndk crate） | WebCodecs → `copy_external_image_to_texture` | 系統解碼器，需自建綁定 |
 | 音訊 | cpal（WASAPI） | cpal（CoreAudio） | cpal（PipeWire、PulseAudio、ALSA） | cpal（AAudio） | cpal（Web Audio） | ohaudio 綁定，需自建 |
-| 下載直譯位元碼 | Microsoft Store：限於 App 描述的功能範圍 | App Store：內建沒問題，下載屬灰色地帶，依據 4.7 小程式條款 | 無商店限制 | Google Play：明文允許直譯器 | 無限制 | AppGallery 3.9：下載改變功能的程式碼有風險 |
+| 下載直譯位元碼 | Microsoft Store：限於 App 描述的功能範圍 | App Store：內建沒問題，下載屬灰色地帶，依據 4.7 小程式條款 | 無商店限制 | Google Play：直譯器例外有條件允許（只能間接存取 Android API、不得下載原生碼或 dex、開發者為內容負責） | 無限制 | AppGallery 3.9：下載改變功能的程式碼有風險 |
 
 ### 14.3 移植契約：新平台要提供什麼
 
@@ -675,7 +693,7 @@ affordance 的前置條件與效果用 CEL 或枚舉的效果類別，不自造�
 
 ### 分階段，按風險排序
 
-**第 0 階段（數週）四個 spike，任何一個不過就回到設計。** 2026-10-24 進度：spike 1 已在 Windows（DX12）與 Android 模擬器（Vulkan）上用同一個引擎跑起來並量測，引擎與演算法的改進見第 4.8 節，紀錄在 docs/spikes/。 第一天就跨平台：spike 的程式碼從第一個 commit 起，就在 CI 上建 Windows、macOS、Linux、Android、iOS、Web 全部目標；量測按 GPU API 族逐一做（第 17 節）。
+**第 0 階段（數週）四個 spike，任何一個不過就回到設計。** 2026-10-24 進度：spike 1 已在 Windows（DX12）與 Android 模擬器（Vulkan）上用同一個引擎跑起來並量測，引擎與演算法的改進見第 4.8 節，紀錄在 docs/spikes/。spike 2 的主體也完成了：頁面包（JSON 清單 + Luau + WGSL）在沙盒 realm 裡建圖，示範頁面整個改用 Luau 寫，Windows 與 Android 都跑這個版本；和同一頁面的 Rust 版相比，幀數、延遲與閒置行為相同，幀 CPU p50 多約 0.2 ms，腳本函數的成本約為它餵給的原生光柵化的十分之一（docs/spikes/spike2-script-pages.md）。 第一天就跨平台：spike 的程式碼從第一個 commit 起，就在 CI 上建 Windows、macOS、Linux、Android、iOS、Web 全部目標；量測按 GPU API 族逐一做（第 17 節）。
 
 1. **一個頁面、所有時間性。** 最小求值器（四種格、串流輸入格、待定格、失效、需求、取消、快照）加 wgpu 桌面殼、單一排程器與分層合成器。同一個頁面同時放五種內容：靜態（引擎自己算出來的大型程序生成畫面，加一份 PDF 資源格）、拉式串流（依賴 `t` 的動畫，由原生算子或 WGSL 算）、推式串流（速率不固定的模擬即時資料與逐字輸出）、非同步（慢算子 Job，有佔位、進度、可取消）、操作（拖曳縮放，以及改一個輸入格讓結果沿圖傳播）。量：滿載時幀時間 p99 是否在預算內；各類內容從事件到像素的延遲；只有一個角落在動時，每幀成本是否只跟那個角落成正比；全部靜止時是否 0 fps；10⁵ 格的失效傳播耗時；記憶體。同一份程式碼要在 Windows（DX12）、macOS 與 iOS（Metal）、Linux 與 Android（Vulkan，含 GL ES 退路）、Web（WebGPU）上都跑起來並量測。repo 裡已有的鏡頭、tile 定址、可取消佇列沿用；PDFium 轉接層改為一個資源格算子。
 2. **腳本建圖。** 一個 Luau realm 透過指令建一張圖、處理事件、定義一個腳本算子。量指令批次的跨界開銷、配額與看門狗、腳本算子被快取後的穩態成本是否為零。驗證「下載的程式碼只組裝、算子執行」這個主張。
@@ -764,7 +782,7 @@ Apple 平台離不開 Mac 的部分是 Xcode 編譯、模擬器、真機除錯�
 - 文字與 IME：排版、雙向、選取、組字框、無障礙樹，靠不變量 7 把輸入交回原生。winit 在 Windows 只有 IMM32，在 iOS、Android、Web 沒有組字，所以文字輸入一律由殼的原生輸入框負責。
 - iOS 上的 WASM 擴充算子只能直譯，開發者自訂解碼器在 iOS 不實用。
 - 和既有網頁內容的互通：是否、何時用 NativeOverlay 嵌 WebView，或以 Blitz 類引擎把 HTML 當成一種處理器頁面。
-- **商店對下載頁面的界線**：內建頁面在所有商店都沒問題。下載的頁面在 App Store 與 Microsoft Store 要落在 App 描述的功能範圍內，App Store 以 4.7 小程式條款為依據；Google Play 明文允許。
+- **商店對下載頁面的界線**：內建頁面在所有商店都沒問題。下載的頁面在 App Store 與 Microsoft Store 要落在 App 描述的功能範圍內，App Store 以 4.7 小程式條款為依據。Google Play 不是無條件允許：「裝置與網路濫用」政策的直譯器例外（明文點名 Lua）要求腳本只能間接存取 Android API、不得下載原生碼或 dex、不得從遠端開啟隱藏功能，開發者要為下載的內容負責，可能有額外審查；第三方發佈的頁面還適用使用者產生內容的規範。
 - **鴻蒙 NEXT 的發佈路徑**：AppGallery 3.9 禁止下載改變功能的程式碼，要決定頁面如何合規，或改走「內建頁面 + 只下載資料」。
 - **遊戲主機**：需要廠商 NDA、開發機與私有 wgpu 後端，等有具體需求再評估。
 
@@ -871,3 +889,57 @@ Apple 平台離不開 Mac 的部分是 Xcode 編譯、模擬器、真機除錯�
 查證時標記為**未能確認**的項目：Rive 的 WASM 在 iOS 上是直譯或 AOT、Rive 每腳本配額；微信 Skyline 底層是否為 Flutter 引擎；Robrix 是否真的上架；Vello 在 iOS / Metal 上的實測；Static Hermes 的 AOT 是否已成預設；Canva 的渲染器內部。平台調查中未能確認的有：鴻蒙 JIT 限制的官方說明、wgpu 各平台的最低 OS 版本、Android TV 與 ChromeOS 的細節、Xbox 經 GDK 走 DX12 的可行性。
 
 一句話總結：**這是一個把所有內容放進同一個頁面的引擎。靜態、流式、非同步與操作中的內容，都是同一張計算圖上時間性不同的格，由一個排程器、一個時鐘、一個合成器驅動；下載的頁面只描述這張圖，編進 App 的原生算子與 GPU 算子執行它。** 效能來自把工作推進算子與 shader，可變性來自把所有語義推出核心，跨平台來自核心只依賴 wgpu 與 C ABI，可被 agent 操控來自每個值都可查詢、每個動作都有型別。
+
+---
+
+## 20. 能力模組：任何 App 都用同一套積木
+
+目標（使用者，2026-10-24）：用這個引擎可以做任何 App。PDF、試算表、CAD、各種語言的文字編輯、雲端（AWS、GCP、OpenAI 格式串流）、影片直播、藍牙、USB、3D 模型與點雲，都能在同一個頁面裡使用，也能互相融合。平台做不到的功能（例如 App Store 上的 USB）就在那個平台缺席。只需要本機的功能免費、開源、可公開分享；雲端服務是 App 的收費方式，不是引擎的設計目的。
+
+### 20.1 分層
+
+| 層 | 用什麼寫 | 負責 |
+|---|---|---|
+| 引擎 | Rust | 計算圖、排程、時鐘、合成、tile、GPU 圖層、輸入與文字焦點 |
+| 執行時 | Rust + Luau | 每頁一個沙盒 realm、`page.*` API、能力與配額、語義埠 |
+| 能力模組 | Rust crate | 一個領域的原生功能：函式、工作、串流、tile、GPU 圖層 |
+| UI 元件庫 | Luau | 版面、按鈕、清單、文字欄位，`import("ui")` |
+| 頁面 | page.json + Luau + WGSL | 一個 App 的介面與邏輯 |
+
+模組的契約、共用資料格式與各模組規格在 docs/MODULES.md。
+
+### 20.2 模組能登記的六種東西
+
+| 種類 | 在哪裡執行 | 頁面怎麼用 |
+|---|---|---|
+| 函式 | 呼叫它的執行緒，同步 | `pdf.page_count(doc)`、`doc:page_count()` |
+| 工作 | 工作池，可取消、有進度 | `page.job(名稱, "pdf.render", {輸入})` |
+| 來源 | 模組自己的執行緒，推送項目 | `page.stream(名稱, "cloud.chat", {request = 輸入格})` |
+| tile | tile 工作執行緒 | `page.tiled{source = "pdf.page", params = 格}` |
+| GPU 圖層 | GPU，畫進離屏紋理，有變化才重畫 | `page.layer{kind = "scene.view", inputs = {...}}` |
+| Luau 函式庫 | 頁面自己的 realm | `import("ui")` |
+
+函式分成純函式與有副作用兩種。有副作用的只能在載入時與事件處理器裡呼叫，不能在格的函數裡呼叫，所以計算圖的函數永遠是純的。
+
+### 20.3 融合靠同一張圖與共用格式
+
+所有模組都透過同一種值（`Data`）與資源句柄（`Res`）交換資料，所以融合不需要任何模組認識另一個模組：
+
+- CAD 放到 PDF 上：`dwg:to_paths(...)` 產生共用的向量路徑，`pdf.add_path(...)` 把它畫進頁面。
+- 用 CAD 與試算表一起運算：`dwg:measure(ids)` 的長度與面積寫進 `sheet.set(...)`，公式重算後的結果再回到圖上的其他格。
+- 把 PDF 變成可運算的格式：`doc:extract(i)` 給出區塊與表格（共用表格格式），可以直接進試算表或交給 agent。
+
+資源被就地修改時以新版本發佈（`Res::next_version`），所有讀過舊版本的格自動重算。
+
+### 20.4 能力與平台
+
+`page.json` 的 `capabilities.modules` 列出必需的模組，缺少時頁面不載入並說明原因；`optional_modules` 列出可有可無的模組（藍牙、USB），腳本用 `if usb then` 判斷。網路只能連 `capabilities.net` 列出的主機，憑證只能由宿主保管、由模組代用（`capabilities.secrets`），檔案只來自對話框與拖放。
+
+### 20.5 Agent
+
+頁面用 `page.action{...}` 宣告動作，`describe()` 與 `act(JSON)` 是語義埠。外部 agent 透過桌面宿主的 `--agent-port`（只聽 127.0.0.1，需要權杖）送 JSON；頁面內的 agent 用 `cloud.chat` 的工具呼叫，執行同一組動作。
+
+### 20.6 現況
+
+2026-10-25：九個模組（text、ui、pdf、sheet、cad、cloud、media、devices、scene）都已實作、經獨立審查與修正，併入主 workspace，由 `anypage-std` 一次登記；整個 workspace 701 個測試通過。四個示範 App（啟動頁 home、CAD＋試算表＋PDF 融合的 studio、人與 agent 共用的 pdf-agent、多語言編輯器 editor）在 Windows 真實視窗與 Android 模擬器上都跑得起來，並有窄螢幕版面。Android 宿主有輸入法、剪貼簿、檔案、藍牙與 USB 橋接、攝影機、Keystore 加密金鑰與頁面導覽。詳見 docs/spikes/spike3-modules.md。
+

@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "id": "com.anypage.cad-demo",
+  "name": "CAD 示範",
+  "version": "1.0.0",
+  "entry": "main.luau",
+  "bounds": [0, 0, 1600, 1000],
+  "capabilities": {
+    "modules": ["cad"],
+    "files": true
+  },
+  "limits": {
+    "memory_mb": 64,
+    "call_ms": 50,
+    "handler_ms": 1000,
+    "load_ms": 4000,
+    "job_workers": 2
+  }
+}

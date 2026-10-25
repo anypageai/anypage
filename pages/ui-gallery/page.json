@@ -1,0 +1,17 @@
+{
+  "format": 1,
+  "id": "com.anypage.ui-gallery",
+  "name": "AnyPage UI gallery",
+  "version": "1.0.0",
+  "entry": "main.luau",
+  "bounds": [0, 0, 2400, 1500],
+  "capabilities": {
+    "clipboard": true
+  },
+  "limits": {
+    "memory_mb": 64,
+    "call_ms": 50,
+    "handler_ms": 50,
+    "load_ms": 2000
+  }
+}

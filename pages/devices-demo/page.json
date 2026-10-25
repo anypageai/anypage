@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "id": "com.anypage.devices-demo",
+  "name": "AnyPage 裝置示範",
+  "version": "1.0.0",
+  "entry": "main.luau",
+  "bounds": [0, 0, 1600, 1040],
+  "capabilities": {
+    "optional_modules": ["ble", "usb", "serial"]
+  }
+}

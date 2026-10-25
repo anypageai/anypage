@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "id": "com.anypage.text-input-test",
+  "name": "文字輸入測試 Text input test",
+  "version": "1.0.0",
+  "entry": "main.luau",
+  "bounds": [0, 0, 720, 860],
+  "capabilities": {
+    "clipboard": true,
+    "files": true
+  },
+  "limits": {
+    "memory_mb": 32,
+    "call_ms": 250,
+    "handler_ms": 200,
+    "load_ms": 2000,
+    "job_workers": 1
+  }
+}

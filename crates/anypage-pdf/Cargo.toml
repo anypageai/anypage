@@ -1,10 +1,24 @@
 [package]
 name = "anypage-pdf"
-description = "L2 adapter: PDFium behind one dedicated thread, rasterising tiles for the core"
-version.workspace = true
-edition.workspace = true
-publish.workspace = true
+description = "PDF module: open, render tiles, extract text and structure, search, annotate, fill forms, edit, save"
+version = "0.0.1"
+edition = "2021"
+publish = false
 
 [dependencies]
-anypage-core = { workspace = true }
-pdfium-render = { workspace = true }
+anypage-core = { path = "../anypage-core" }
+anypage-engine = { path = "../anypage-engine" }
+anypage-runtime = { path = "../anypage-runtime" }
+log = "0.4"
+hayro = { version = "0.8", default-features = false, features = ["embed-fonts", "embed-cmaps"] }
+lopdf = { version = "0.46", default-features = false }
+# same versions hayro uses; for reading fonts (reverse cmaps, CJK fallback check) and PNG input
+skrifa = "0.46"
+png = "0.18"
+# already in the tree (hayro, lopdf): counting decoders for the decompression-bomb check
+flate2 = "1"
+weezl = "0.2"
+memchr = "2"
+
+[dev-dependencies]
+serde_json = "1"

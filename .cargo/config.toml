@@ -1,0 +1,8 @@
+# Android: Luau is C++. Link its C++ runtime statically into the one native
+# library the app ships, instead of shipping libc++_shared.so next to it.
+# apps/android/build.rs adds libc++abi, which libc++_static needs.
+[env]
+CXXSTDLIB_aarch64_linux_android = "c++_static"
+CXXSTDLIB_x86_64_linux_android = "c++_static"
+CXXSTDLIB_armv7_linux_androideabi = "c++_static"
+CXXSTDLIB_i686_linux_android = "c++_static"

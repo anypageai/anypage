@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="secrets_title">金鑰 Secrets</string>
+    <string name="secrets_short">金鑰</string>
+    <string name="secrets_long">金鑰設定 Secrets</string>
+</resources>

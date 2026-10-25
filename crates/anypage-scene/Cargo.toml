@@ -1,0 +1,28 @@
+[package]
+name = "anypage-scene"
+description = "3D module: meshes and point clouds (glTF, OBJ, STL, PLY, LAS/LAZ, XYZ) rendered as a GPU layer"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+anypage-core = { path = "../anypage-core" }
+anypage-engine = { path = "../anypage-engine" }
+anypage-runtime = { path = "../anypage-runtime" }
+log = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+# wait on wgpu error scopes (the engine uses the same crate)
+pollster = "0.4"
+# f64 camera maths (relative-to-eye matrices keep LAS/UTM coordinates exact)
+glam = "0.30"
+# Loaders. All pure Rust, permissive licences (MIT / Apache-2.0).
+gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }
+base64 = "0.22"
+# f64 parsing: positions are recentred in f64 before narrowing to f32
+tobj = { version = "4", default-features = false, features = ["use_f64"] }
+stl_io = "0.11"
+las = { version = "0.11", features = ["laz"] }
+
+[dev-dependencies]
+png = "0.17"
+serde_json = "1"

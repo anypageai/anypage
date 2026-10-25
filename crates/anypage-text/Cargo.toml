@@ -1,0 +1,31 @@
+[package]
+name = "anypage-text"
+description = "Text system: shaping, bidi, font fallback and line breaking for every script (cosmic-text)"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Shaping (harfrust), bidi, UAX #14 line breaking, font database and
+# fallback; glyph rasterisation through swash. "fontconfig" is left out: it
+# only matters on desktop Linux, where fontdb's directory scan is enough.
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
+# glyph rendering, hashing, script and line-break tables, system locale.
+# swash 0.2.10 accepts skrifa 0.31-0.44 but resolves to 0.44, while
+# cosmic-text 0.19 needs 0.40: Cargo.lock pins swash's skrifa to 0.40
+# (`cargo update -p skrifa@0.44.0 --precise 0.40.0`), so skrifa, read-fonts
+# and font-types are built once. The root workspace needs the same pin at
+# integration (CORE_REQUESTS.md).
+swash = "0.2.6"
+rustc-hash = "2.1"
+unicode-script = "0.5.8"
+unicode-linebreak = "0.1.5"
+unicode-segmentation = "1.12"
+sys-locale = "0.3.2"
+# COLRv1 colour glyphs: clip masks and layer blend modes (the engine uses
+# the same tiny-skia; skrifa comes through cosmic-text's re-export)
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+log = "0.4"
+
+[dev-dependencies]
+png = "0.17"
