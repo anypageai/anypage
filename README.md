@@ -1,54 +1,92 @@
-# AnyPage 引擎
+# AnyPage
 
-把所有內容放進同一個頁面的引擎。靜態、流式、非同步與操作中的內容，都是同一張計算圖上的函數，由一個排程器、一個時鐘、一個合成器驅動。沒有靜態元件與動態元件之分：靜態是輸入不變的函數，動態是輸入會變的函數，時間也只是一個輸入。
+AnyPage is a Rust engine that renders every kind of content in one page: documents, live data streams, results of background work and user interaction. All of it runs on one computation graph, one scheduler, one clock and one GPU compositor.
 
-目標平台：iOS、macOS、Windows、Linux、Android、Web 第一天一起支援；鴻蒙、visionOS、電視、車機、嵌入式與遊戲主機靠移植契約接上（架構第 14 節）。
+Apps are page packages: a `page.json` manifest, Luau scripts, WGSL shaders and assets. A page runs in a sandboxed Luau realm with memory and time limits and uses native modules for heavy work.
 
-設計文件：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。量測紀錄在 [docs/spikes/](docs/spikes/)。
+## How the engine decides what to compute
 
-狀態：**第 0 階段。** 引擎、執行時、九個能力模組與 Windows、Android 兩個宿主都已跑起來並量測過。App 用頁面包寫：`page.json` + Luau 腳本 + WGSL + 素材，在沙盒裡載入，透過能力模組使用 PDF、試算表、CAD、雲端、影片直播、藍牙、USB、3D（模組契約：[docs/MODULES.md](docs/MODULES.md)）。iOS、macOS、Linux、Web 還沒做。
+- **Dependency tracking.** Every value records the inputs it read. A change recomputes only the values that read it.
+- **Early cutoff.** When a recomputed value equals the previous one, propagation stops and nothing is redrawn.
+- **Declared validity.** A function can state the time until which its value holds. The engine sleeps until the earliest such time instead of redrawing every frame.
 
-## 目錄
+When nothing changes, the engine draws no frames.
 
-| 路徑 | 層 | 內容 |
+## Modules
+
+| Module | Script name | Provides |
 |---|---|---|
-| `crates/anypage-core` | L1 執行時 | 計算圖：需求驅動、提早截斷、可預測時間（計時器堆積）、分幀求值；工作池；tile 佇列；鏡頭 |
-| `crates/anypage-engine` | L1 執行時 | 引擎：每幀排程、預測喚醒、合成器（wgpu）、tile、GPU 算子與 GPU 圖層、輸入、文字焦點、量測 |
-| `crates/anypage-text` | L1 執行時 | 文字系統：造字、雙向文字、字型後備、UAX #14 斷行、彩色 emoji |
-| `crates/anypage-runtime` | L3 腳本 | 頁面包、每頁一個 Luau realm（沙盒、配額、能力）、`page.*` API、原生模組登記、語義埠 |
-| `crates/anypage-ui` | L3 腳本 | UI 元件庫（Luau）：版面、按鈕、清單、表格、文字欄、對話框 |
-| `crates/anypage-pdf` | L2 模組 | PDF：繪製、文字與位置、搜尋、抽成表格、註記、表單、編輯、存檔 |
-| `crates/anypage-sheet` | L2 模組 | 試算表（IronCalc）：xlsx、CSV、公式 |
-| `crates/anypage-cad` | L2 模組 | CAD：DXF 讀寫、繪製、量測、編輯；STEP 轉網格 |
-| `crates/anypage-cloud` | L2 模組 | 雲端：OpenAI 相容串流、HTTP、S3、Google Cloud Storage |
-| `crates/anypage-media` | L2 模組 | 影片：HLS 直播播放、直播推流、攝影機 |
-| `crates/anypage-devices` | L2 模組 | 藍牙 LE、USB、序列埠 |
-| `crates/anypage-scene` | L2 模組 | 3D：網格與點雲 |
-| `crates/anypage-std` | L2 模組 | 一次登記所有模組；兩個宿主都用它 |
-| `crates/anypage-demo` | L4 頁面 | 示範頁面的 Rust 版、示範用原生算子、自動量測腳本 |
-| `pages/` | L4 頁面 | 頁面包：`home`（啟動頁）、`studio`（CAD＋試算表＋PDF 融合）、`pdf-agent`（人與 agent 共用的 PDF 工作台）、`editor`（多語言編輯器）、`ui-gallery`、各模組的 `*-demo`、`demo` |
-| `apps/desktop` | L0 殼 | winit 殼：剪貼簿、檔案對話框、拖放、IME、頁面導覽、本機 agent 連接埠（目前只在 Windows 驗證） |
-| `apps/android` | L0 殼 | Kotlin 原生宿主 + Rust JNI：輸入法、剪貼簿、檔案、藍牙、USB、攝影機、加密金鑰、頁面導覽 |
+| text | built into the engine | Shaping, bidirectional text, font fallback, UAX #14 line breaking, colour emoji |
+| ui | `import("ui")` | Layout, buttons, lists, tables, text fields, dialogs |
+| pdf | `pdf` | Rendering, text with positions, search, table extraction, annotations, forms, editing, saving |
+| sheet | `sheet` | xlsx and CSV with formulas (IronCalc) |
+| cad | `cad` | DXF read, render, measure, edit, write; STEP to meshes |
+| cloud | `cloud` | OpenAI-compatible streaming chat, HTTP, Amazon S3, Google Cloud Storage |
+| media | `media` | HLS live playback, live broadcast to HLS, camera capture |
+| devices | `ble`, `usb`, `serial` | Bluetooth LE, USB, serial ports |
+| scene | `scene` | Meshes and point clouds as a GPU layer |
 
-## 跑起來
+A page can only use the modules its manifest declares. Network hosts, secrets, file access and the clipboard are declared the same way. The module contract and the page API are in [docs/MODULES.md](docs/MODULES.md).
 
-Windows：
+## Platforms
+
+| Platform | Status |
+|---|---|
+| Windows | Supported and tested |
+| Android | Supported, tested on the emulator (API 35) |
+| macOS, Linux | Planned |
+| iOS, Web | Planned |
+
+## Example pages
+
+| Page | What it shows |
+|---|---|
+| `pages/home` | Launcher for every page, with the modules each one needs |
+| `pages/studio` | A CAD floor plan measured into a spreadsheet cost table, then placed with the table into a PDF report |
+| `pages/pdf-agent` | A PDF workspace operated by people and by agents, with an in-page assistant that runs page actions through tool calls |
+| `pages/editor` | A multilingual text editor: IME, right-to-left text, find and replace, open and save |
+| `pages/ui-gallery` | Every UI element in dark and light themes |
+| `pages/*-demo` | One page per module |
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `crates/anypage-core` | Computation graph, worker pool, tile queue, camera |
+| `crates/anypage-engine` | Frame scheduling, wake-up prediction, wgpu compositor, tiles, GPU layers, input, text focus |
+| `crates/anypage-text` | Text system |
+| `crates/anypage-runtime` | Page packages, Luau realms, the `page.*` API, native module registry, semantic port |
+| `crates/anypage-ui` | UI component library in Luau |
+| `crates/anypage-{pdf,sheet,cad,cloud,media,devices,scene}` | Capability modules |
+| `crates/anypage-std` | Registers every module; both apps use it |
+| `crates/anypage-demo` | Demo operators and the scripted benchmark |
+| `apps/desktop` | Desktop app (winit): clipboard, file dialogs, drag and drop, IME, page navigation, local agent port |
+| `apps/android` | Android app (Kotlin and JNI): IME, clipboard, files, Bluetooth, USB, camera, encrypted secrets, page navigation |
+| `pages/` | Page packages |
+
+## Build and run
+
+Windows, with Rust 1.92 or later:
 
 ```powershell
-cargo run --release -p anypage-desktop                 # 互動模式
-cargo run --release -p anypage-desktop -- --bench      # 22 秒自動量測，報告寫進 bench-results/
-cargo run --release -p anypage-desktop -- --page pages/home   # 從資料夾載入頁面包（改了 Luau 不必重新編譯）
-cargo run --release -p anypage-desktop -- --page pages/studio --agent-port 7700   # 開放本機 agent 連接埠
-cargo run --release -p anypage-desktop -- --hud        # 顯示量測面板（h 切換）
-cargo run --release -p anypage-desktop -- --rust-demo  # 同一個頁面的 Rust 版，用來對照
-cargo run --release -p anypage-demo --example script_costs    # 每個面板的腳本成本與光柵化成本
-cargo run --release -p anypage-core --example graph_bench
+cargo run --release -p anypage-desktop -- --page pages/home
+cargo run --release -p anypage-desktop -- --page pages/studio --agent-port 7700
+cargo run --release -p anypage-desktop -- --bench
 cargo test --workspace
 ```
 
-不帶 `--page` 時載入編進 App 的 `pages/demo`。在頁面裡用 `page.navigate` 開別的頁面後，Alt+Left 或滑鼠的上一頁鍵回到上一頁。雲端模組用的金鑰放在 `%APPDATA%\AnyPage\secrets.json` 或環境變數 `ANYPAGE_SECRET_<名稱>`。
+| Option | Effect |
+|---|---|
+| `--page <dir>` | Load a page package from a folder; Luau changes need no rebuild |
+| `--pages <dir>` | Where `page.navigate` looks for packages (default: next to `--page`) |
+| `--agent-port <port>` | Accept agent requests on 127.0.0.1 |
+| `--bench` | Run the 22-second scripted benchmark and write a report to `bench-results/` |
+| `--hud` | Show the measurement panel (`h` toggles it) |
+| `--rust-demo` | The built-in demo page written in Rust, for comparison |
 
-Android（需要 Android SDK、NDK 27 與 `cargo install cargo-ndk`；Luau 的 C++ 執行時由 `.cargo/config.toml` 與 `apps/android/build.rs` 靜態連結，不必另外打包 `libc++_shared.so`）：
+Without `--page`, the built-in demo package loads. Alt+Left or the mouse back button returns to the previous page. Secrets for the cloud module come from `ANYPAGE_SECRET_<NAME>` environment variables or `%APPDATA%\AnyPage\secrets.json`. `ANYPAGE_BACKEND=vulkan|dx12|gl` forces a GPU backend.
+
+Android, with the Android SDK, NDK 27 and `cargo install cargo-ndk`:
 
 ```powershell
 $env:ANDROID_NDK_HOME = "$env:LOCALAPPDATA\Android\Sdk\ndk\27.1.12297006"
@@ -59,17 +97,34 @@ $env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
 adb install -r app\build\outputs\apk\debug\app-debug.apk
 ```
 
-操作：拖曳平移，滾輪或雙指縮放，空白鍵 串流，A 連續動畫，T 定時內容，J 任務，C 取消，1 / 2 迭代，R 貼合，H 隱藏量測面板。`ANYPAGE_BACKEND=vulkan|dx12|gl` 可強制 GPU 後端。
+The APK includes every package in `pages/` and starts on `home`. `adb shell am start -n com.anypage.engine/.MainActivity --es page studio` opens a specific page. The C++ runtime that Luau needs is linked statically, so no `libc++_shared.so` is shipped.
 
-## 授權 License
+## Agents
 
-本機程式碼以 MIT 或 Apache-2.0 雙授權釋出，任選其一：[LICENSE-MIT](LICENSE-MIT)、[LICENSE-APACHE](LICENSE-APACHE)。
+With `--agent-port`, the desktop app prints a token. A client sends the token as its first line, then one JSON request per line, and gets one JSON line back for each. For `pages/pdf-agent`:
 
-Licensed under either of MIT or Apache-2.0, at your option. Unless you state otherwise, any contribution you submit for inclusion is dual licensed the same way, without additional terms.
+```text
+{"describe": true}
+{"action": "search", "params": {"query": "revenue"}}
+{"get": "info"}
+{"set": "page", "value": 2}
+```
 
-第三方元件 Third-party notes:
+`describe` lists the page's actions and named cells. Pages declare actions with `page.action{...}`; `set` only accepts inputs a page marks as agent-writable.
 
-- 依賴的 crate 各自保有授權（MIT、Apache-2.0、BSD、ISC、Zlib、MPL-2.0；`cargo tree` 可列出）。
-- `anypage-media` 從原始碼編譯 Cisco OpenH264（BSD-2-Clause）。H.264 有專利；自行編譯的 OpenH264 不在 Cisco 代付專利授權的範圍內，散布編譯好的 App 前請自行確認。
-- TLS 根憑證清單來自 `webpki-roots`（CDLA-Permissive-2.0）。
-- 字型取自作業系統，倉庫不附任何字型檔。
+## Documentation
+
+- [docs/MODULES.md](docs/MODULES.md): module contract, shared data formats, page API
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): design (Traditional Chinese)
+- [docs/spikes/](docs/spikes/): measurements (Traditional Chinese)
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Unless you state otherwise, any contribution you submit for inclusion is dual licensed the same way, without additional terms.
+
+Third-party notes:
+
+- Dependencies keep their own licenses (MIT, Apache-2.0, BSD, ISC, Zlib, MPL-2.0); `cargo tree` lists them.
+- `anypage-media` builds Cisco's OpenH264 (BSD-2-Clause) from source. H.264 is covered by patents, and Cisco's patent license covers only binaries Cisco distributes. Check your obligations before distributing an app built with it.
+- TLS root certificates come from `webpki-roots` (CDLA-Permissive-2.0).
+- Fonts come from the operating system; this repository ships none.
